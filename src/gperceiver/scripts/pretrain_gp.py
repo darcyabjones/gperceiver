@@ -8,7 +8,6 @@ from typing import List
 
 import pandas as pd
 
-import tensorflow as tf
 from tensorflow.data import Dataset
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -23,13 +22,13 @@ from .exitcodes import (
 from ..preprocessing import pairwise_correlation, prep_aec
 from ..layers import (
     PrepMarkers,
-    LearnedLatent,
     PerceiverBlock,
     PerceiverDecoderBlock,
     SquareRelu,
 )
 
 from ..models import (
+    PerceiverLatentInitialiser,
     PerceiverMarkerEncoder,
     PerceiverEncoderDecoder,
 )
@@ -89,14 +88,21 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--encoder",
         type=str,
         help="Where to store the encoder model",
-        default="encoder.h5"
+        default="encoder"
+    )
+
+    parser.add_argument(
+        "--latent",
+        type=str,
+        help="Where to store the latent model",
+        default="latent"
     )
 
     parser.add_argument(
         "--encoder-decoder",
         type=str,
         help="Where to store the combined encoder/decoder model",
-        default="encoder_decoder.h5"
+        default="encoder_decoder"
     )
 
     parser.add_argument(
@@ -180,16 +186,6 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     return parsed
 
 
-class ExportMarkerEmbedder(tf.Module):
-
-    def __init__(self, me):
-        self.me = me
-
-    @tf.function(input_signature=[tf.TensorSpec(shape=[None, None, None], dtype=tf.float32)])
-    def __call__(self, X):
-        return self.me(X)
-
-
 def runner(args):
     genos = pd.read_csv(args.markers, sep="\t")
     genos.set_index("name", inplace=True)
@@ -197,13 +193,16 @@ def runner(args):
     train = Dataset.from_tensor_slices(genos.values)
 
     hamming_positions = pairwise_correlation(genos.values)
+    latent_initialiser = PerceiverLatentInitialiser(
+        args.output_dim,
+        args.latent_dim
+    )
     encoder = PerceiverMarkerEncoder(
         PrepMarkers(
             positions=hamming_positions,
             embed_dim=args.marker_embed_dim,
             output_dim=args.projection_dim,
         ),
-        LearnedLatent(output_dim=args.output_dim, latent_dim=args.latent_dim),
         perceivers=[
             PerceiverBlock(
                 projection_units=args.projection_dim,
@@ -214,7 +213,13 @@ def runner(args):
         num_iterations=args.num_encode_iters,
     )
 
+    lsize = [
+        layers.Input(train.map(prep_aec).element_spec[0].shape),
+        layers.Input((None, args.output_dim))
+    ]
+    encoder(lsize)
     model1 = PerceiverEncoderDecoder(
+        latent_initialiser=latent_initialiser,
         encoder=encoder,
         decoder=PerceiverDecoderBlock(projection_units=args.projection_dim),
         predictor=keras.Sequential([
@@ -249,13 +254,9 @@ def runner(args):
         verbose=1
     )
 
-    marker_encoder = ExportMarkerEmbedder(model1.encoder)
-    tf.saved_model.save(marker_encoder, export_dir="embedder")
-
-    #model1.encoder.save_weights(
-    #    args.encoder,
-    #    save_format="h5",
-    #)
+    model1.encoder.save(args.encoder)
+    model1.latent_initialiser.save(args.latent)
+    model1.save(args.encoder_decoder)
     return
 
 

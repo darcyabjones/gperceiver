@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -219,7 +218,6 @@ class LearnedLatent(layers.Layer):
         return
 
     def call(self, inputs, training=False):
-        shape = tf.shape(inputs)
         latent = tf.expand_dims(self.latent, 0)
         latent = tf.cast(latent, self.dtype)
         return latent
