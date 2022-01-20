@@ -88,21 +88,21 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--encoder",
         type=str,
         help="Where to store the encoder model",
-        default="encoder"
+        default=None
     )
 
     parser.add_argument(
         "--latent",
         type=str,
         help="Where to store the latent model",
-        default="latent"
+        default=None
     )
 
     parser.add_argument(
         "--encoder-decoder",
         type=str,
         help="Where to store the combined encoder/decoder model",
-        default="encoder_decoder"
+        default=None
     )
 
     parser.add_argument(
@@ -151,7 +151,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--num-sa-heads",
         type=int,
         help="The number heads to use for self attention",
-        default=2
+        default=4
     )
 
     parser.add_argument(
@@ -171,7 +171,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--num-decode-iters",
         type=int,
-        help="The number iterations to run through the decoder network",
+        help="The number of iterations to run through the decoder network",
         default=4
     )
 
@@ -194,6 +194,26 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         type=int,
         help="The maximum number of epochs",
         default=500
+    )
+
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        help=(
+            "How many epochs since we've seen an "
+            "improvement should we run?"
+        ),
+        default=50
+    )
+
+    parser.add_argument(
+        "--reduce-lr-patience",
+        type=int,
+        help=(
+            "How many epochs since we've seen an improvement "
+            "should we run before reducing the lr?"
+        ),
+        default=10
     )
 
     parser.add_argument(
@@ -276,26 +296,14 @@ def runner(args):
         name="encoder_decoder"
     )
 
-    if args.checkpoint is None:
-        model1.load_weights(args.checkpoint)
-    # model1 = keras.models.load_model(
-    #     args.checkpoint,
-    #     custom_objects={
-    #         "encoder_decoder": PerceiverEncoderDecoder,
-    #         "decoder": PerceiverDecoderBlock,
-    #         "encoder": PerceiverMarkerEncoder,
-    #         "prep_markers": PrepMarkers,
-    #         "perceiver_block": PerceiverBlock,
-    #         "latent": PerceiverLatentInitialiser
-    #     },
-    #     compile=False
-    # )
-
     model1.compile(
         optimizer=LAMB(args.lr, weight_decay_rate=0.0001),
         loss="categorical_crossentropy",
         metrics="accuracy",
     )
+
+    if args.last_checkpoint is not None:
+        model1.load_weights(args.last_checkpoint)
 
     reduce_lr = keras.callbacks.ReduceLROnPlateau(
         monitor="loss", factor=0.1, patience=5
@@ -303,7 +311,9 @@ def runner(args):
 
     # Create an early stopping callback.
     early_stopping = keras.callbacks.EarlyStopping(
-        monitor="loss", patience=10, restore_best_weights=True
+        monitor="loss",
+        patience=args.early_stopping_patience,
+        restore_best_weights=True
     )
 
     callbacks = [early_stopping, reduce_lr]
@@ -333,21 +343,23 @@ def runner(args):
                 save_freq="epoch"
             )
         )
+
     # Fit the model.
-    try:
-        model1.fit(
-            train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
-            epochs=args.nepochs,
-            callbacks=callbacks,
-            verbose=0
-        )
-    except Exception as e:
-        raise e
-    finally:
+    model1.fit(
+        train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
+        epochs=args.nepochs,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    if args.encoder_decoder is not None:
         model1.save(args.encoder_decoder)
+
+    if args.encoder is not None:
         model1.encoder.save(args.encoder)
+
+    if args.latent is not None:
         model1.latent_initialiser.save(args.latent)
-    return
 
 
 def main():  # noqa
