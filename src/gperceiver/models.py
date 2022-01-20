@@ -98,6 +98,7 @@ class PerceiverMarkerEncoder(keras.Model):
 
                 else:
                     latent = perceiver([markers, latent], training=training)
+            i += 1
 
         if return_attention_scores:
             return latent, attentions
@@ -124,9 +125,10 @@ class PerceiverEncoderDecoder(keras.Model):
         encoder: PerceiverMarkerEncoder,
         decoder: PerceiverDecoderBlock,
         predictor: layers.Layer,
-        num_decode_iters: int = 4,
+        num_decode_iters: int = 1,
+        **kwargs
     ):
-        super(PerceiverEncoderDecoder, self).__init__()
+        super(PerceiverEncoderDecoder, self).__init__(**kwargs)
         self.latent_initialiser = latent_initialiser
         self.encoder = encoder
         self.decoder = decoder

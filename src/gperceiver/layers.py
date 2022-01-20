@@ -217,9 +217,10 @@ class LearnedLatent(layers.Layer):
         self.built = True
         return
 
-    def call(self, inputs, training=False):
+    def call(self, X):
         latent = tf.expand_dims(self.latent, 0)
         latent = tf.cast(latent, self.dtype)
+        latent = tf.repeat(latent, tf.shape(X)[0], axis=0)
         return latent
 
     def get_config(self):

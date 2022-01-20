@@ -4,7 +4,7 @@ import sys
 import traceback
 import argparse
 
-from typing import List
+from typing import List, Callable
 
 import pandas as pd
 
@@ -106,6 +106,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        help="Start from this model instead of a new one",
+        default=None
+    )
+
+    parser.add_argument(
         "--marker-embed-dim",
         type=int,
         help="The number of dimensions for the per-marker learned embeddings",
@@ -186,50 +193,88 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     return parsed
 
 
+def make_epoch_scheduler(
+    max_iters: int,
+    frequency: int = 1
+) -> "Callable[[int, int], int]":
+    def scheduler(epoch: int, num_iterations: int) -> int:
+        if (
+            (epoch > 0)
+            and (epoch % frequency == 0)
+            and (num_iterations < max_iters)
+        ):
+            num_iterations += 1
+        return num_iterations
+
+    return scheduler
+
+
 def runner(args):
     genos = pd.read_csv(args.markers, sep="\t")
     genos.set_index("name", inplace=True)
 
     train = Dataset.from_tensor_slices(genos.values)
 
-    hamming_positions = pairwise_correlation(genos.values)
-    latent_initialiser = PerceiverLatentInitialiser(
-        args.output_dim,
-        args.latent_dim
-    )
-    encoder = PerceiverMarkerEncoder(
-        PrepMarkers(
-            positions=hamming_positions,
-            embed_dim=args.marker_embed_dim,
-            output_dim=args.projection_dim,
-        ),
-        perceivers=[
-            PerceiverBlock(
-                projection_units=args.projection_dim,
-                num_heads=args.num_sa_heads,
-                num_self_attention=args.num_sa,
-            )
-        ],
-        num_iterations=args.num_encode_iters,
-    )
+    if args.checkpoint is None:
+        hamming_positions = pairwise_correlation(genos.values)
+        latent_initialiser = PerceiverLatentInitialiser(
+            args.output_dim,
+            args.latent_dim,
+            name="latent"
+        )
+        encoder = PerceiverMarkerEncoder(
+            PrepMarkers(
+                positions=hamming_positions,
+                embed_dim=args.marker_embed_dim,
+                output_dim=args.projection_dim,
+                name="prep_markers"
+            ),
+            perceivers=[
+                PerceiverBlock(
+                    projection_units=args.projection_dim,
+                    num_heads=args.num_sa_heads,
+                    num_self_attention=args.num_sa,
+                    name="perceiver_block"
+                )
+            ],
+            num_iterations=args.num_encode_iters,
+            name="encoder"
+        )
 
-    lsize = [
-        layers.Input(train.map(prep_aec).element_spec[0].shape),
-        layers.Input((None, args.output_dim))
-    ]
-    encoder(lsize)
-    model1 = PerceiverEncoderDecoder(
-        latent_initialiser=latent_initialiser,
-        encoder=encoder,
-        decoder=PerceiverDecoderBlock(projection_units=args.projection_dim),
-        predictor=keras.Sequential([
-            layers.Dropout(0.5),
-            layers.Dense(32, activation=SquareRelu()),
-            layers.Dropout(0.5),
-            layers.Dense(3, activation="softmax")]
-        ),
-        num_decode_iters=args.num_decode_iters,
-    )
+        lsize = [
+            layers.Input(train.map(prep_aec).element_spec[0].shape),
+            layers.Input((None, args.output_dim))
+        ]
+        encoder(lsize)
+        model1 = PerceiverEncoderDecoder(
+            latent_initialiser=latent_initialiser,
+            encoder=encoder,
+            decoder=PerceiverDecoderBlock(
+                projection_units=args.projection_dim,
+                name="decoder"
+            ),
+            predictor=keras.Sequential([
+                layers.Dropout(0.5),
+                layers.Dense(32, activation=SquareRelu()),
+                layers.Dropout(0.5),
+                layers.Dense(3, activation="softmax")]
+            ),
+            num_decode_iters=args.num_decode_iters,
+            name="encoder_decoder"
+        )
+    else:
+        model1 = keras.models.load_model(
+            args.checkpoint,
+            custom_objects={
+                "encoder_decoder": PerceiverEncoderDecoder,
+                "decoder": PerceiverDecoderBlock,
+                "encoder": PerceiverMarkerEncoder,
+                "prep_markers": PrepMarkers,
+                "perceiver_block": PerceiverBlock,
+                "latent": PerceiverLatentInitialiser
+            },
+            compile=False
+        )
 
     model1.compile(
         optimizer=LAMB(args.lr, weight_decay_rate=0.0001),
@@ -247,16 +292,19 @@ def runner(args):
     )
 
     # Fit the model.
-    model1.fit(
-        train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
-        epochs=args.nepochs,
-        callbacks=[early_stopping, reduce_lr],
-        verbose=1
-    )
-
-    model1.encoder.save(args.encoder)
-    model1.latent_initialiser.save(args.latent)
-    model1.save(args.encoder_decoder)
+    try:
+        model1.fit(
+            train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
+            epochs=args.nepochs,
+            callbacks=[early_stopping, reduce_lr],
+            verbose=1
+        )
+    except Exception as e:
+        raise e
+    finally:
+        model1.save(args.encoder_decoder)
+        model1.encoder.save(args.encoder)
+        model1.latent_initialiser.save(args.latent)
     return
 
 
