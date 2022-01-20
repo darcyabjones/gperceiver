@@ -106,7 +106,14 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--checkpoint",
+        "--best-checkpoint",
+        type=str,
+        help="Start from this model instead of a new one",
+        default=None
+    )
+
+    parser.add_argument(
+        "--last-checkpoint",
         type=str,
         help="Start from this model instead of a new one",
         default=None
@@ -188,6 +195,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         help="The maximum number of epochs",
         default=500
     )
+
+    parser.add_argument(
+        "--logs",
+        type=str,
+        help="Save a log file in tsv format",
+        default=None
+    )
     parsed = parser.parse_args(args)
 
     return parsed
@@ -215,66 +229,67 @@ def runner(args):
 
     train = Dataset.from_tensor_slices(genos.values)
 
-    if args.checkpoint is None:
-        hamming_positions = pairwise_correlation(genos.values)
-        latent_initialiser = PerceiverLatentInitialiser(
-            args.output_dim,
-            args.latent_dim,
-            name="latent"
-        )
-        encoder = PerceiverMarkerEncoder(
-            PrepMarkers(
-                positions=hamming_positions,
-                embed_dim=args.marker_embed_dim,
-                output_dim=args.projection_dim,
-                name="prep_markers"
-            ),
-            perceivers=[
-                PerceiverBlock(
-                    projection_units=args.projection_dim,
-                    num_heads=args.num_sa_heads,
-                    num_self_attention=args.num_sa,
-                    name="perceiver_block"
-                )
-            ],
-            num_iterations=args.num_encode_iters,
-            name="encoder"
-        )
-
-        lsize = [
-            layers.Input(train.map(prep_aec).element_spec[0].shape),
-            layers.Input((None, args.output_dim))
-        ]
-        encoder(lsize)
-        model1 = PerceiverEncoderDecoder(
-            latent_initialiser=latent_initialiser,
-            encoder=encoder,
-            decoder=PerceiverDecoderBlock(
+    hamming_positions = pairwise_correlation(genos.values)
+    latent_initialiser = PerceiverLatentInitialiser(
+        args.output_dim,
+        args.latent_dim,
+        name="latent"
+    )
+    encoder = PerceiverMarkerEncoder(
+        PrepMarkers(
+            positions=hamming_positions,
+            embed_dim=args.marker_embed_dim,
+            output_dim=args.projection_dim,
+            name="prep_markers"
+        ),
+        perceivers=[
+            PerceiverBlock(
                 projection_units=args.projection_dim,
-                name="decoder"
-            ),
-            predictor=keras.Sequential([
-                layers.Dropout(0.5),
-                layers.Dense(32, activation=SquareRelu()),
-                layers.Dropout(0.5),
-                layers.Dense(3, activation="softmax")]
-            ),
-            num_decode_iters=args.num_decode_iters,
-            name="encoder_decoder"
-        )
-    else:
-        model1 = keras.models.load_model(
-            args.checkpoint,
-            custom_objects={
-                "encoder_decoder": PerceiverEncoderDecoder,
-                "decoder": PerceiverDecoderBlock,
-                "encoder": PerceiverMarkerEncoder,
-                "prep_markers": PrepMarkers,
-                "perceiver_block": PerceiverBlock,
-                "latent": PerceiverLatentInitialiser
-            },
-            compile=False
-        )
+                num_heads=args.num_sa_heads,
+                num_self_attention=args.num_sa,
+                name="perceiver_block"
+            )
+        ],
+        num_iterations=args.num_encode_iters,
+        name="encoder"
+    )
+
+    lsize = [
+        layers.Input(train.map(prep_aec).element_spec[0].shape),
+        layers.Input((None, args.output_dim))
+    ]
+    encoder(lsize)
+    model1 = PerceiverEncoderDecoder(
+        latent_initialiser=latent_initialiser,
+        encoder=encoder,
+        decoder=PerceiverDecoderBlock(
+            projection_units=args.projection_dim,
+            name="decoder"
+        ),
+        predictor=keras.Sequential([
+            layers.Dropout(0.5),
+            layers.Dense(32, activation=SquareRelu()),
+            layers.Dropout(0.5),
+            layers.Dense(3, activation="softmax")]
+        ),
+        num_decode_iters=args.num_decode_iters,
+        name="encoder_decoder"
+    )
+
+    if args.checkpoint is None:
+        model1.load_weights(args.checkpoint)
+    # model1 = keras.models.load_model(
+    #     args.checkpoint,
+    #     custom_objects={
+    #         "encoder_decoder": PerceiverEncoderDecoder,
+    #         "decoder": PerceiverDecoderBlock,
+    #         "encoder": PerceiverMarkerEncoder,
+    #         "prep_markers": PrepMarkers,
+    #         "perceiver_block": PerceiverBlock,
+    #         "latent": PerceiverLatentInitialiser
+    #     },
+    #     compile=False
+    # )
 
     model1.compile(
         optimizer=LAMB(args.lr, weight_decay_rate=0.0001),
@@ -291,13 +306,40 @@ def runner(args):
         monitor="loss", patience=10, restore_best_weights=True
     )
 
+    callbacks = [early_stopping, reduce_lr]
+    if args.logs is not None:
+        callbacks.append(
+            keras.callbacks.CSVLogger(args.logs, separator="\t", append=True)
+        )
+
+    if args.best_checkpoint is not None:
+        callbacks.append(
+            keras.callbacks.ModelCheckpoint(
+                filepath=args.best_checkpoint,
+                monitor="loss",
+                save_best_only=True,
+                save_weights_only=True,
+                save_freq="epoch"
+            )
+        )
+
+    if args.last_checkpoint is not None:
+        callbacks.append(
+            keras.callbacks.ModelCheckpoint(
+                filepath=args.last_checkpoint,
+                monitor="loss",
+                save_best_only=False,
+                save_weights_only=True,
+                save_freq="epoch"
+            )
+        )
     # Fit the model.
     try:
         model1.fit(
             train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
             epochs=args.nepochs,
-            callbacks=[early_stopping, reduce_lr],
-            verbose=1
+            callbacks=callbacks,
+            verbose=0
         )
     except Exception as e:
         raise e
