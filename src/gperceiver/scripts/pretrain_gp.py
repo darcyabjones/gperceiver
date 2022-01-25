@@ -311,29 +311,9 @@ def runner(args):  # noqa
         ])
         tsvd.fit(genos.T)
         pca = tsvd.transform(genos.T)
-
-        with strategy.scope():
-            rel_embed = layers.Embedding(
-                input_dim=nmarkers,
-                output_dim=args.projection_dim,
-                embeddings_initializer=InitializeWithValues(values=pca),
-                trainable=args.relational_embed_trainable == 0,
-                name="relational_embedder"
-            )
-
-        del pca
         del tsvd
-    elif args.relational_embed == "normal":
-        with strategy.scope():
-            rel_embed = layers.Embedding(
-                input_dim=nmarkers,
-                output_dim=args.projection_dim,
-                embeddings_initializer="random_normal",
-                trainable=True,
-                name="relational_embedder"
-            )
     else:
-        rel_embed = None
+        pca = None
 
     if args.use_linkage_positions:
         positions = np.cumsum(pairwise_correlation(genos.values))
@@ -363,6 +343,25 @@ def runner(args):  # noqa
             position_embeddings_trainable=False,
             name="prep_markers"
         )
+        if args.relational_embed == "rsvd":
+            rel_embed = layers.Embedding(
+                input_dim=nmarkers,
+                output_dim=args.projection_dim,
+                embeddings_initializer=InitializeWithValues(values=pca),
+                trainable=args.relational_embed_trainable == 0,
+                name="relational_embedder"
+            )
+            del pca
+        elif args.relational_embed == "normal":
+            rel_embed = layers.Embedding(
+                input_dim=nmarkers,
+                output_dim=args.projection_dim,
+                embeddings_initializer="random_normal",
+                trainable=True,
+                name="relational_embedder"
+            )
+        else:
+            rel_embed = None
 
         encoder = PerceiverEncoder(
             num_iterations=args.num_encode_iters,
@@ -374,21 +373,20 @@ def runner(args):  # noqa
             name="encoder"
         )
 
-    # This stuff initialises it so that the encoder can take
-    # variable length sequences
-    lsize = [
-        layers.Input((None, args.output_dim)),
-        layers.Input((None, args.marker_embed_dim)),
-    ]
+	# This stuff initialises it so that the encoder can take
+	# variable length sequences
+        lsize = [
+            layers.Input((None, args.output_dim)),
+            layers.Input((None, args.marker_embed_dim)),
+        ]
 
-    if args.relational_embed is not None:
-        lsize.append(
-            layers.Input((None, args.projection_dim))
-        )
+        if args.relational_embed is not None:
+            lsize.append(
+                layers.Input((None, args.projection_dim))
+            )
 
-    encoder(lsize)
+        encoder(lsize)
 
-    with strategy.scope():
         decoder = CrossAttention(
             projection_units=args.projection_dim,
             name="decoder"
