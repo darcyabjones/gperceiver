@@ -4,10 +4,12 @@ import sys
 import traceback
 import argparse
 
-from typing import List, Callable
+from typing import List
 
+import numpy as np
 import pandas as pd
 
+import tensorflow as tf
 from tensorflow.data import Dataset
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -19,19 +21,21 @@ from .exitcodes import (
     EXIT_INPUT_NOT_FOUND, EXIT_SYSERR, EXIT_CANT_OUTPUT
 )
 
-from ..preprocessing import pairwise_correlation, prep_aec
+from ..preprocessing import pairwise_correlation, PrepAEC
 from ..layers import (
-    PrepMarkers,
-    PerceiverBlock,
-    PerceiverDecoderBlock,
-    SquareRelu,
+    CrossAttention,
 )
 
 from ..models import (
-    PerceiverLatentInitialiser,
-    PerceiverMarkerEncoder,
+    LatentInitialiser,
+    MarkerEmbedding,
+    PerceiverEncoder,
     PerceiverEncoderDecoder,
 )
+
+from ..initializers import FourierEncoding, InitializeWithValues
+
+from ..callbacks import ReduceLRWithWarmup, SetTrainableAt
 
 __email__ = "darcy.ab.jones@gmail.com"
 
@@ -85,6 +89,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--nalleles",
+        type=int,
+        help="How many different alleles are in there?",
+        default=3,
+    )
+
+    parser.add_argument(
         "--encoder",
         type=str,
         help="Where to store the encoder model",
@@ -106,16 +117,23 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--best-checkpoint",
+        "--checkpoint",
         type=str,
         help="Start from this model instead of a new one",
         default=None
     )
 
     parser.add_argument(
+        "--best-checkpoint",
+        type=str,
+        help="Save the best checkpoint here",
+        default=None
+    )
+
+    parser.add_argument(
         "--last-checkpoint",
         type=str,
-        help="Start from this model instead of a new one",
+        help="Start checkpoint from most recent epoch here.",
         default=None
     )
 
@@ -123,21 +141,40 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--marker-embed-dim",
         type=int,
         help="The number of dimensions for the per-marker learned embeddings",
-        default=4
+        default=128
+    )
+
+    parser.add_argument(
+        "--relational-embed",
+        choices=["tsvd", "normal", "none"],
+        help="Add a relational embedding to the marker positions",
+        default="none"
+    )
+
+    parser.add_argument(
+        "--relational-embed-trainable",
+        type=int,
+        help=(
+            "How many epochs to wait before setting the "
+            "relational embeddings to be trainable. "
+            "0 lets train from beginning, -1 (default)"
+            "means it wont ever be trainable."
+        ),
+        default=-1
     )
 
     parser.add_argument(
         "--projection-dim",
         type=int,
         help="The number of channels to use for attention comparisons",
-        default=64
+        default=128
     )
 
     parser.add_argument(
         "--latent-dim",
         type=int,
         help="The number of learned latent features to use",
-        default=64
+        default=128
     )
 
     parser.add_argument(
@@ -172,14 +209,31 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--num-decode-iters",
         type=int,
         help="The number of iterations to run through the decoder network",
-        default=4
+        default=2
     )
 
     parser.add_argument(
         "--lr",
         type=float,
-        help="The initial learning rate",
+        help="The maximum learning rate",
         default=1e-3
+    )
+
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        help="The number of epochs to ramp up the learning rate",
+        default=9,
+    )
+
+    parser.add_argument(
+        "--pre-warmup-epochs",
+        type=int,
+        help=(
+            "The number of epochs run with a minimal learning rate "
+            "before beginning the warmup."
+        ),
+        default=1,
     )
 
     parser.add_argument(
@@ -217,6 +271,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--use-linkage-positions",
+        action="store_true",
+        help="Use hamming distance for positional encodings.",
+        default=False
+    )
+
+    parser.add_argument(
         "--logs",
         type=str,
         help="Save a log file in tsv format",
@@ -227,86 +288,152 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     return parsed
 
 
-def make_epoch_scheduler(
-    max_iters: int,
-    frequency: int = 1
-) -> "Callable[[int, int], int]":
-    def scheduler(epoch: int, num_iterations: int) -> int:
-        if (
-            (epoch > 0)
-            and (epoch % frequency == 0)
-            and (num_iterations < max_iters)
-        ):
-            num_iterations += 1
-        return num_iterations
+def runner(args):  # noqa
+    if tf.config.list_physical_devices("GPU"):
+        strategy = tf.distribute.MirroredStrategy()
+    else:
+        strategy = tf.distribute.get_strategy()
 
-    return scheduler
-
-
-def runner(args):
     genos = pd.read_csv(args.markers, sep="\t")
     genos.set_index("name", inplace=True)
 
-    train = Dataset.from_tensor_slices(genos.values)
+    nmarkers = genos.shape[1]
+    nsamples = genos.shape[0]
 
-    hamming_positions = pairwise_correlation(genos.values)
-    latent_initialiser = PerceiverLatentInitialiser(
-        args.output_dim,
-        args.latent_dim,
-        name="latent"
-    )
-    encoder = PerceiverMarkerEncoder(
-        PrepMarkers(
-            positions=hamming_positions,
-            embed_dim=args.marker_embed_dim,
-            output_dim=args.projection_dim,
-            name="prep_markers"
-        ),
-        perceivers=[
-            PerceiverBlock(
-                projection_units=args.projection_dim,
-                num_heads=args.num_sa_heads,
-                num_self_attention=args.num_sa,
-                name="perceiver_block"
+    if args.relational_embed == "tsvd":
+        from sklearn.pipeline import Pipeline
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.preprocessing import RobustScaler
+
+        tsvd = Pipeline([
+            ("tsvd", TruncatedSVD(n_components=args.projection_dim)),
+            ("scaler", RobustScaler(quantile_range=(10.0, 90.0)))
+        ])
+        tsvd.fit(genos.T)
+        pca = tsvd.transform(genos.T)
+
+        with strategy.scope():
+            rel_embed = layers.Embedding(
+                input_dim=nmarkers,
+                output_dim=args.projection_dim,
+                embeddings_initializer=InitializeWithValues(values=pca),
+                trainable=args.relational_embed_trainable == 0,
+                name="relational_embedder"
             )
-        ],
-        num_iterations=args.num_encode_iters,
-        name="encoder"
-    )
 
+        del pca
+        del tsvd
+    elif args.relational_embed == "normal":
+        with strategy.scope():
+            rel_embed = layers.Embedding(
+                input_dim=nmarkers,
+                output_dim=args.projection_dim,
+                embeddings_initializer="random_normal",
+                trainable=True,
+                name="relational_embedder"
+            )
+    else:
+        rel_embed = None
+
+    if args.use_linkage_positions:
+        positions = np.cumsum(pairwise_correlation(genos.values))
+    else:
+        positions = None
+
+    with tf.device("/CPU:0"):
+        train = Dataset.from_tensor_slices(genos.values)
+        prep_aec = PrepAEC(offset=1, prop_ones=0.8)
+
+    del genos
+
+    with strategy.scope():
+        latent_initialiser = LatentInitialiser(
+            args.output_dim,
+            args.latent_dim,
+            name="latent"
+        )
+
+        marker_embedding = MarkerEmbedding(
+            nalleles=args.nalleles + 1,
+            npositions=nmarkers,
+            output_dim=args.marker_embed_dim,
+            position_embeddings_initializer=FourierEncoding(
+                positions=positions
+            ),
+            position_embeddings_trainable=False,
+            name="prep_markers"
+        )
+
+        encoder = PerceiverEncoder(
+            num_iterations=args.num_encode_iters,
+            projection_units=args.projection_dim,
+            num_self_attention=args.num_sa,
+            num_self_attention_heads=args.num_sa_heads,
+            add_pos=True,
+            share_weights="after_first_xa",
+            name="encoder"
+        )
+
+    # This stuff initialises it so that the encoder can take
+    # variable length sequences
     lsize = [
-        layers.Input(train.map(prep_aec).element_spec[0].shape),
-        layers.Input((None, args.output_dim))
+        layers.Input((None, args.output_dim)),
+        layers.Input((None, args.marker_embed_dim)),
     ]
+
+    if args.relational_embed is not None:
+        lsize.append(
+            layers.Input((None, args.projection_dim))
+        )
+
     encoder(lsize)
-    model1 = PerceiverEncoderDecoder(
-        latent_initialiser=latent_initialiser,
-        encoder=encoder,
-        decoder=PerceiverDecoderBlock(
+
+    with strategy.scope():
+        decoder = CrossAttention(
             projection_units=args.projection_dim,
             name="decoder"
-        ),
-        predictor=keras.Sequential([
-            layers.Dropout(0.5),
-            layers.Dense(32, activation=SquareRelu()),
-            layers.Dropout(0.5),
-            layers.Dense(3, activation="softmax")]
-        ),
-        num_decode_iters=args.num_decode_iters,
-        name="encoder_decoder"
-    )
+        )
+        predictor = layers.Dense(
+            args.nalleles,
+            activation="softmax",
+            name="predictor"
+        )
 
-    model1.compile(
-        optimizer=LAMB(args.lr, weight_decay_rate=0.0001),
-        loss="categorical_crossentropy",
-        metrics="accuracy",
-    )
+        model1 = PerceiverEncoderDecoder(
+            latent_initialiser=latent_initialiser,
+            marker_embedder=marker_embedding,
+            encoder=encoder,
+            decoder=decoder,
+            predictor=predictor,
+            relational_embedder=rel_embed,
+            num_decode_iters=args.num_decode_iters,
+            name="encoder_decoder"
+        )
 
-    if args.last_checkpoint is not None:
-        model1.load_weights(args.last_checkpoint)
+        if (args.warmup_epochs == 0) and (args.pre_warmup_epochs == 0):
+            initial_lr = args.lr
+        else:
+            initial_lr = 1e-10
 
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(
-        monitor="loss", factor=0.1, patience=5
+        model1.compile(
+            optimizer=LAMB(initial_lr, weight_decay_rate=0.0001),
+            loss=keras.losses.SparseCategoricalCrossentropy(),
+            metrics="accuracy",
+        )
+
+    if args.checkpoint is not None:
+        model1.load_weights(args.checkpoint)
+
+    reduce_lr = ReduceLRWithWarmup(
+        max_lr=args.lr,
+        pre_warmup=args.pre_warmup_epochs,
+        warmup=args.warmup_epochs,
+        monitor='loss',
+        factor=0.1,
+        patience=args.reduce_lr_patience,
+        min_delta=1e-4,
+        cooldown=0,
+        min_lr=1e-16,
     )
 
     # Create an early stopping callback.
@@ -317,6 +444,15 @@ def runner(args):
     )
 
     callbacks = [early_stopping, reduce_lr]
+
+    if (
+        (args.relational_embed == "tsvd")
+        and (args.relational_embed_trainable > 0)
+    ):
+        callbacks.append(
+            SetTrainableAt(rel_embed, args.relational_embed_trainable)
+        )
+
     if args.logs is not None:
         callbacks.append(
             keras.callbacks.CSVLogger(args.logs, separator="\t", append=True)
@@ -344,10 +480,12 @@ def runner(args):
             )
         )
 
+    batch_size = args.batch_size * strategy.num_replicas_in_sync
+
     # Fit the model.
     model1.fit(
-        train.shuffle(genos.shape[0]).map(prep_aec).batch(args.batch_size),
-        epochs=args.nepochs,
+        train.shuffle(nsamples).map(prep_aec).batch(batch_size),
+        epochs=args.nepochs + args.warmup_epochs + args.pre_warmup_epochs,
         callbacks=callbacks,
         verbose=1
     )

@@ -5,239 +5,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import Any, Optional
     from typing import Dict
-    from typing import List
     # import numpy.typing as npt
 
 import tensorflow as tf
 from tensorflow.keras import layers
-from tensorflow.keras import initializers, regularizers, constraints
-
-
-class GetPositionalEncoding(layers.Layer):
-    """Computes a standard fourier series sine/cosine positional encoding
-    on the fly.
-
-    Keyword arguments:
-        positions: A 1D array or tensor, to use instead of a normal range.
-            Use if the time series data has an uneven lag.
-        output_dim: The number of features to create per position.
-            Output shape will be [batch; ntimesteps; output_dim]
-        min_freq: A very small float to avoid numerical instability issues.
-    """
-
-    def __init__(
-        self,
-        output_dim: int,
-        positions: "Optional[List[float]]" = None,
-        min_freq: float = 1e-4,
-        **kwargs
-    ):
-        kwargs["autocast"] = False
-        super(GetPositionalEncoding, self).__init__(**kwargs)
-        self.output_dim = output_dim
-        self.min_freq = min_freq
-
-        if positions is None:
-            self.positions = None
-        else:
-            self.positions = tf.convert_to_tensor(positions)
-
-        self.supports_masking = True
-        return
-
-    def positional_encoding(self, positions):
-        """Thanks to
-        https://towardsdatascience.com/master-positional-encoding-part-i-63c05d90a0c3
-        """
-
-        position = tf.cast(positions, dtype=self.dtype)
-        mask = tf.range(self.output_dim)
-        sin_mask = tf.cast(mask % 2, tf.float32)
-        cos_mask = 1 - sin_mask
-        exponent = 2 * (mask // 2)
-        exponent = (
-            tf.cast(exponent, tf.float32) /
-            tf.cast(self.output_dim, tf.float32)
-        )
-        freqs = self.min_freq ** exponent
-        angles = tf.einsum('i,j->ij', position, freqs)
-        pos_enc = (
-            (tf.math.cos(angles) * cos_mask) +
-            (tf.math.sin(angles) * sin_mask)
-        )
-        return pos_enc
-
-    def call(self, X):
-        if self.positions is not None:
-            pos_enc = self.positional_encoding(self.positions)
-        else:
-            pos_enc = tf.cast(self.positional_encoding(
-                tf.range(start=0, limit=tf.shape(X)[1], delta=1)
-            ), dtype=self.dtype)
-
-        pos_enc = tf.expand_dims(pos_enc, 0)
-        return tf.repeat(pos_enc, tf.shape(X)[0], axis=0)
-
-    def get_config(self):
-        config = super(GetPositionalEncoding, self).get_config()
-        config.update({
-            "positions": self.positions.numpy().tolist(),
-            "output_dim": self.output_dim,
-            "min_freq": self.min_freq
-        })
-        return config
-
-
-class PrepMarkers(layers.Layer):
-    """Computes a standard fourier series sine/cosine positional encoding
-    on the fly.
-
-    Keyword arguments:
-        positions: A 1D array or tensor, to use instead of a normal range.
-            Use if the time series data has an uneven lag.
-        output_dim: The number of features to create per position.
-            Output shape will be [batch; ntimesteps; output_dim]
-        min_freq: A very small float to avoid numerical instability issues.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        output_dim: int,
-        positions: "Optional[List[float]]" = None,
-        min_freq: float = 1e-4,
-        **kwargs
-    ):
-        kwargs["autocast"] = False
-        super(PrepMarkers, self).__init__(**kwargs)
-
-        self.embed_dim = embed_dim
-        self.output_dim = output_dim
-        self.min_freq = min_freq
-
-        if positions is None:
-            self.positions = None
-        else:
-            self.positions = tf.convert_to_tensor(positions)
-
-        self.embed = layers.LocallyConnected1D(
-            filters=embed_dim,
-            kernel_size=1,
-            implementation=3,
-            name="embed",
-            use_bias=True,
-        )
-
-        self.project = layers.Dense(output_dim, name="project")
-        self.positional = GetPositionalEncoding(
-            output_dim,
-            positions=positions,
-            min_freq=min_freq,
-            name="positional"
-        )
-        self.add = layers.Add(name="add")
-
-        self.supports_masking = True
-        return
-
-    def build(self, input_shape):
-        self.input_spec = layers.InputSpec(
-            shape=(None, None, input_shape[-1])
-        )
-        return
-
-    def call(self, X):
-        posenc = self.positional(X)
-
-        embedded = self.embed(X)
-        projected = self.project(embedded)
-        added = self.add([projected, posenc])
-        return added
-
-    def get_config(self):
-        config = super(PrepMarkers, self).get_config()
-        config.update({
-            "embed_dim": self.embed_dim,
-            "positions": self.positions.numpy().tolist(),
-            "output_dim": self.output_dim,
-            "min_freq": self.min_freq
-        })
-        return config
-
-
-class LearnedLatent(layers.Layer):
-
-    def __init__(
-        self,
-        output_dim: int,
-        latent_dim: int,
-        latent_initializer='uniform',
-        latent_regularizer=None,
-        activity_regularizer=None,
-        latent_constraint=None,
-        **kwargs
-    ):
-        """ Constructs a 2D tensor of trainable weights.
-
-        Keyword arguments:
-          output_dim: the number of "channels" in the embedding.
-          latent_dim: the number of learned query vectors.
-                      The output matrix will be (batch, latent_dim, output_dim)
-        """
-        if latent_dim <= 0 or output_dim <= 0:
-            raise ValueError(
-                'Both `latent_dim` and `output_dim` should be positive, '
-                f'Received latent_dim = {latent_dim} and '
-                f'output_dim = {output_dim}'
-            )
-
-        kwargs["autocast"] = False
-        super(LearnedLatent, self).__init__(**kwargs)
-
-        self.latent_dim = latent_dim
-        self.output_dim = output_dim
-
-        self.latent_initializer = initializers.get(latent_initializer)
-        self.latent_regularizer = regularizers.get(latent_regularizer)
-        self.activity_regularizer = regularizers.get(activity_regularizer)
-        self.latent_constraint = constraints.get(latent_constraint)
-        self.supports_masking = False
-        return
-
-    def build(self, input_shape=None):
-        self.latent = self.add_weight(
-            shape=(self.latent_dim, self.output_dim),
-            initializer=self.latent_initializer,
-            name='latent',
-            regularizer=self.latent_regularizer,
-            constraint=self.latent_constraint,
-            experimental_autocast=False,
-            trainable=True
-        )
-        self.built = True
-        return
-
-    def call(self, X):
-        latent = tf.expand_dims(self.latent, 0)
-        latent = tf.cast(latent, self.dtype)
-        latent = tf.repeat(latent, tf.shape(X)[0], axis=0)
-        return latent
-
-    def get_config(self):
-        config = super(LearnedLatent, self).get_config()
-        config.update({
-            "output_dim": self.output_dim,
-            "latent_dim": self.latent_dim,
-            'latent_initializer':
-                initializers.serialize(self.latent_initializer),
-            'latent_regularizer':
-                regularizers.serialize(self.latent_regularizer),
-            'activity_regularizer':
-                regularizers.serialize(self.activity_regularizer),
-            'latent_constraint':
-                constraints.serialize(self.latent_constraint),
-        })
-        return config
+from tensorflow.python.keras.layers.dense_attention import BaseDenseAttention
 
 
 class TwoStepDense(layers.Layer):
@@ -444,6 +216,218 @@ class ResidualDense(layers.Layer):
         return config
 
 
+class CustomAttention(BaseDenseAttention):
+    def __init__(
+        self,
+        add_pos=False,
+        **kwargs
+    ):
+        super(CustomAttention, self).__init__(**kwargs)
+        self.add_pos = add_pos
+
+        self._custom_built = False
+        return
+
+    def custom_build(  # noqa
+        self,
+        query,
+        key,
+        value,
+        query_pos=None,
+        key_pos=None,
+    ):
+        """Creates scale variable if use_scale==True."""
+
+        self._custom_built = True
+
+        from tensorflow.python.framework import tensor_shape
+
+        if hasattr(query, "shape"):
+            query_shape = tensor_shape.TensorShape(query.shape)
+        else:
+            query_shape = tensor_shape.TensorShape(query)
+
+        if hasattr(key, "shape"):
+            key_shape = tensor_shape.TensorShape(key.shape)
+        else:
+            key_shape = tensor_shape.TensorShape(key)
+
+        self._key_dim = key_shape[-1]
+
+        # if hasattr(value, "shape"):
+        #     value_shape = tensor_shape.TensorShape(value.shape)
+        # else:
+        #     value_shape = tensor_shape.TensorShape(value)
+
+        if query_pos is None:
+            query_pos_shape = None
+            self._query_pos_dim = None
+        elif hasattr(query_pos, "shape"):
+            query_pos_shape = tensor_shape.TensorShape(query_pos.shape)
+            self._query_pos_dim = query_pos_shape[-1]
+        else:
+            query_pos_shape = tensor_shape.TensorShape(query_pos)
+            self._query_pos_dim = query_pos_shape[-1]
+
+        if key_pos is None:
+            key_pos_shape = None
+            self._key_pos_dim = None
+        elif hasattr(key_pos, "shape"):
+            key_pos_shape = tensor_shape.TensorShape(key_pos.shape)
+            self._key_pos_dim = key_pos_shape[-1]
+        else:
+            key_pos_shape = tensor_shape.TensorShape(key_pos)
+            self._key_pos_dim = key_pos_shape[-1]
+
+        if self.add_pos:
+            if key_pos_shape is not None:
+                assert key_shape == key_pos_shape
+            if query_pos_shape is not None:
+                assert query_shape == query_pos_shape
+
+        self._custom_built = True
+
+    def _calculate_scores(self, query, key, query_pos=None, key_pos=None):
+        """Calculates attention scores as a query-key dot product.
+        Args:
+          query: Query tensor of shape `[batch_size, Tq, dim]`.
+          key: Key tensor of shape `[batch_size, Tv, dim]`.
+        Returns:
+          Tensor of shape `[batch_size, Tq, Tv]`.
+        """
+
+        if self.add_pos:
+            if query_pos is not None:
+                query += query_pos
+
+            if key_pos is not None:
+                key += key_pos
+
+        scores = tf.matmul(query, key, transpose_b=True)
+        scores *= 1. / (tf.math.sqrt(float(self._key_dim) + 1e-7))
+
+        if (
+            ((query_pos is not None)
+             or (key_pos is not None))
+            and not self.add_pos
+        ):
+            if query_pos is None:
+                query_pos = query
+
+            if key_pos is None:
+                key_pos = key
+
+            pos_scores = tf.matmul(query_pos, key_pos, transpose_b=True)
+            pos_scores *= 1. / (tf.math.sqrt(float(self._key_pos_dim) + 1e-7))
+            scores += pos_scores
+
+        return scores
+
+    def _validate_call_args(self, inputs, mask):
+        """Validates arguments of the call method."""
+        class_name = self.__class__.__name__
+        if mask is not None:
+            if not isinstance(mask, list):
+                raise ValueError(
+                    '{} layer mask must be a list, '
+                    'namely [query_mask, value_mask].'.format(class_name))
+            if len(mask) < 2 or len(mask) > len(inputs):
+                raise ValueError(
+                    (
+                        '{} layer mask must be a list of length 2, namely '
+                        '[query_mask, value_mask]. Given length: {}'
+                    ).format(class_name, len(mask))
+                )
+
+    def call(
+        self,
+        query,
+        key,
+        value,
+        query_pos=None,
+        key_pos=None,
+        mask=None,
+        training=None,
+        return_attention_scores=False
+    ):
+        if not self._custom_built:
+            self.custom_build(
+                query,
+                key,
+                value,
+                query_pos,
+                key_pos,
+            )
+
+        q_mask = mask[0] if mask else None
+        v_mask = mask[1] if mask else None
+        scores = self._calculate_scores(
+            query=query,
+            key=key,
+            query_pos=query_pos,
+            key_pos=key_pos,
+        )
+        if v_mask is not None:
+            # Mask of shape [batch_size, 1, Tv].
+            v_mask = tf.expand_dims(v_mask, axis=-2)
+
+        if self.causal:
+            # Creates a lower triangular mask, so position i cannot attend to
+            # positions j>i. This prevents the flow of information from the
+            # future into the past.
+            scores_shape = tf.shape(scores)
+            # causal_mask_shape = [1, Tq, Tv].
+            causal_mask_shape = tf.concat(
+                [tf.ones_like(scores_shape[:-2]), scores_shape[-2:]],
+                axis=0)
+            causal_mask = self._lower_triangular_mask(causal_mask_shape)
+        else:
+            causal_mask = None
+
+        scores_mask = self._merge_masks(v_mask, causal_mask)
+        result, attention_scores = self._apply_scores(
+            scores=scores,
+            value=value,
+            scores_mask=scores_mask,
+            training=training
+        )
+
+        if q_mask is not None:
+            # Mask of shape [batch_size, Tq, 1].
+            q_mask = tf.expand_dims(q_mask, axis=-1)
+            result *= tf.cast(q_mask, dtype=result.dtype)
+
+        if return_attention_scores:
+            return result, attention_scores
+
+        return result
+
+    @staticmethod
+    def _lower_triangular_mask(shape):
+        """Creates a lower-triangular boolean mask over the
+        last 2 dimensions.
+        """
+
+        row_index = tf.cumsum(
+            tf.ones(shape=shape, dtype=tf.int32), axis=-2)
+        col_index = tf.cumsum(
+            tf.ones(shape=shape, dtype=tf.int32), axis=-1)
+        return tf.greater_equal(row_index, col_index)
+
+    @staticmethod
+    def _merge_masks(x, y):
+        if x is None:
+            return y
+        if y is None:
+            return x
+        return tf.logical_and(x, y)
+
+    def get_config(self):
+        config = {'use_scale': self.use_scale, "add_pos": self.add_pos}
+        base_config = super(CustomAttention, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 class CrossAttention(layers.Layer):
 
     def __init__(
@@ -451,6 +435,9 @@ class CrossAttention(layers.Layer):
         projection_units: "Optional[int]" = None,
         dropout_rate: float = 0.1,
         epsilon: float = 1e-6,
+        add_pos: bool = False,
+        projection_kwargs: "Optional[Dict[str, Any]]" = None,
+        ff_kwargs: "Optional[Dict[str, Any]]" = None,
         **kwargs
     ):
         """A standard single headed attention layer with
@@ -462,80 +449,224 @@ class CrossAttention(layers.Layer):
         self.projection_units = projection_units
         self.epsilon = epsilon
         self.dropout_rate = dropout_rate
+        self.add_pos = add_pos
 
-        self.latent_norm = layers.LayerNormalization(
+        if ff_kwargs is None:
+            ff_kwargs = {}
+        self.ff_kwargs = ff_kwargs
+
+        if projection_kwargs is None:
+            projection_kwargs = {}
+        self.projection_kwargs = projection_kwargs
+
+        self.qnorm = layers.LayerNormalization(
             epsilon=epsilon,
-            name="latent_norm"
+            name="qnorm"
         )
-        self.data_norm = layers.LayerNormalization(
+        self.kvnorm = layers.LayerNormalization(
             epsilon=epsilon,
-            name="data_norm"
+            name="kvnorm"
         )
 
-        self.attention = layers.Attention(
-            use_scale=True,
+        self.attention = CustomAttention(
             dropout=dropout_rate,
             name="attention"
         )
         self.add = layers.Add(name="add")
+
+        self.supports_masking = True
+        self._custom_built = False
         return
 
-    def build(self, input_shape):
-        data_shape, group_shape = input_shape
+    def custom_build(  # noqa
+        self,
+        query,
+        key_value,
+        query_pos=None,
+        key_pos=None,
+    ):
+        from tensorflow.python.framework import tensor_shape
+        self._custom_built = True
+
+        if hasattr(query, "shape"):
+            q_shape = tensor_shape.TensorShape(query.shape)
+        else:
+            q_shape = tensor_shape.TensorShape(query)
+
+        # if hasattr(key_value, "shape"):
+        #     kv_shape = tensor_shape.TensorShape(key_value.shape)
+        # else:
+        #     kv_shape = tensor_shape.TensorShape(key_value)
+
+        if query_pos is None:
+            query_pos_shape = None
+        elif hasattr(query_pos, "shape"):
+            query_pos_shape = tensor_shape.TensorShape(query_pos.shape)
+        else:
+            query_pos_shape = tensor_shape.TensorShape(query_pos)
+
+        if key_pos is None:
+            key_pos_shape = None
+        elif hasattr(key_pos, "shape"):
+            key_pos_shape = tensor_shape.TensorShape(key_pos.shape)
+        else:
+            key_pos_shape = tensor_shape.TensorShape(key_pos)
+
         if self.projection_units is None:
-            self.projection_units = group_shape[-1]
+            self.projection_units = q_shape[-1]
 
         self.query_dense = layers.Dense(
             units=self.projection_units,
-            name="query_dense"
+            name="query_dense",
+            **self.projection_kwargs
         )
         self.key_dense = layers.Dense(
             units=self.projection_units,
-            name="key_dense"
+            name="key_dense",
+            **self.projection_kwargs
         )
         self.value_dense = layers.Dense(
-            units=group_shape[-1],
-            name="value_dense"
+            units=q_shape[-1],
+            name="value_dense",
+            **self.projection_kwargs
         )
-        self.built = True
+
+        if self.add_pos:
+            if query_pos_shape is None:
+                self.query_pos_dense = None
+            elif query_pos_shape[-1] != self.projection_units:
+                self.query_pos_dense = layers.Dense(
+                    units=self.projection_units,
+                    name="query_pos_dense",
+                    **self.projection_kwargs
+                )
+            else:
+                self.query_pos_dense = None
+
+            if key_pos_shape is None:
+                self.key_pos_dense = None
+            elif key_pos_shape[-1] != self.projection_units:
+                self.key_pos_dense = layers.Dense(
+                    units=self.projection_units,
+                    name="key_pos_dense",
+                    **self.projection_kwargs
+                )
+            else:
+                self.key_pos_dense = None
+        else:
+            if (query_pos_shape is None) and (key_pos_shape is not None):
+                self.query_pos_dense = layers.Dense(
+                    units=key_pos_shape[-1],
+                    name="query_pos_dense",
+                    **self.projection_kwargs
+                )
+            else:
+                self.query_pos_dense = None
+
+            if (query_pos_shape is not None) and (key_pos_shape is None):
+                self.key_pos_dense = layers.Dense(
+                    units=query_pos_shape[-1],
+                    name="key_pos_dense",
+                    **self.projection_kwargs
+                )
+            else:
+                self.key_pos_dense = None
+
+        if self.ff_kwargs is None:
+            ff_kwargs = {
+                "inner_activation": SquareRelu(),
+                "epsilon": self.epsilon,
+                "dropout_rate": 0.0
+            }
+        else:
+            ff_kwargs = self.ff_kwargs
+
+        self.ff = ResidualDense(
+            inner_units=self.projection_units,
+            name="ff",
+            **ff_kwargs
+        )
+        self._custom_built = True
         return
 
-    def call(self, X, training=False, return_attention_scores=False):
-        data, latent = X
-        latent = self.latent_norm(latent)
-        data = self.data_norm(data)
+    def call(
+        self,
+        query,
+        key_value,
+        query_pos=None,
+        key_pos=None,
+        mask=None,
+        training=False,
+        return_attention_scores=False
+    ):
+        if not self._custom_built:
+            self.custom_build(
+                query,
+                key_value,
+                query_pos,
+                key_pos,
+            )
 
-        query = self.query_dense(latent)
-        key = self.key_dense(data)
-        value = self.value_dense(data)
+        qnorm = self.qnorm(query)
+        kvnorm = self.kvnorm(key_value)
+
+        query = self.query_dense(qnorm)
+        key = self.key_dense(kvnorm)
+        value = self.value_dense(kvnorm)
+
+        if self.query_pos_dense is not None:
+            if self.add_pos:
+                query_pos = self.query_pos_dense(query_pos)
+            else:
+                query_pos = self.query_pos_dense(qnorm)
+        if self.key_pos_dense is not None:
+            if self.add_pos:
+                key_pos = self.key_pos_dense(key_pos)
+            else:
+                key_pos = self.key_pos_dense(kvnorm)
 
         if return_attention_scores:
             attention_output, attention_scores = self.attention(
-                [query, value, key],
+                query=query,
+                key=key,
+                value=value,
+                key_pos=key_pos,
+                query_pos=query_pos,
+                mask=mask,
                 training=training,
                 return_attention_scores=True
             )
         else:
             attention_output = self.attention(
-                [query, value, key],
+                query=query,
+                key=key,
+                value=value,
+                key_pos=key_pos,
+                query_pos=query_pos,
+                mask=mask,
                 training=training,
                 return_attention_scores=False
             )
             attention_scores = None
 
-        attention_output = self.add([attention_output, latent])
+        attention_output = self.add([attention_output, qnorm])
+
+        output = self.ff(attention_output, training=training)
 
         if return_attention_scores:
-            return attention_output, attention_scores
+            return output, attention_scores
         else:
-            return attention_output
+            return output
 
     def get_config(self):
         config = super(CrossAttention, self).get_config()
         config.update({
             "projection_units": self.projection_units,
             "epsilon": self.epsilon,
+            "add_pos": self.add_pos,
             "dropout_rate": self.dropout_rate,
+            "projection_kwargs": self.projection_kwargs,
+            "ff_kwargs": self.ff_kwargs,
         })
         return config
 
@@ -557,17 +688,18 @@ class SquareRelu(layers.Layer):
         return config
 
 
-class TransformerSelfAttention(layers.Layer):
+class SelfAttention(layers.Layer):
 
     def __init__(
         self,
         num_heads: int,
         projection_units: "Optional[int]" = None,
-        epsilon=1e-6,
+        epsilon: float = 1e-6,
         dropout_rate: float = 0.1,
+        ff_kwargs: "Optional[Dict[str, Any]]" = None,
         **kwargs
     ):
-        super(TransformerSelfAttention, self).__init__(**kwargs)
+        super(SelfAttention, self).__init__(**kwargs)
 
         self.add = layers.Add(name="add")
         self.lnorm = layers.LayerNormalization(epsilon=epsilon, name="lnorm")
@@ -576,6 +708,8 @@ class TransformerSelfAttention(layers.Layer):
         self.dropout_rate = dropout_rate
         self.projection_units = projection_units
         self.epsilon = epsilon
+        self.ff_kwargs = ff_kwargs
+        self.supports_masking = True
         return
 
     def build(self, input_shape):
@@ -589,15 +723,37 @@ class TransformerSelfAttention(layers.Layer):
             dropout=self.dropout_rate,
             name="mha"
         )
+
+        if self.ff_kwargs is None:
+            ff_kwargs = {
+                "inner_activation": SquareRelu(),
+                "epsilon": self.epsilon,
+                "dropout_rate": 0.0
+            }
+        else:
+            ff_kwargs = self.ff_kwargs
+
+        self.ff = ResidualDense(
+            inner_units=self.projection_units,
+            name="ff",
+            **ff_kwargs
+        )
         self.built = True
         return
 
-    def call(self, X, training=False, return_attention_scores=False):
+    def call(
+        self,
+        X,
+        mask=None,
+        training=False,
+        return_attention_scores=False
+    ):
         x1 = self.lnorm(X)
         if return_attention_scores:
             attention_output, attention_scores = self.mha(
                 x1,
                 x1,
+                attention_mask=mask,
                 training=training,
                 return_attention_scores=return_attention_scores,
                 )
@@ -605,220 +761,26 @@ class TransformerSelfAttention(layers.Layer):
             attention_output = self.mha(
                 x1,
                 x1,
+                attention_mask=mask,
                 training=training,
                 return_attention_scores=False,
             )
 
         x1 = self.add([attention_output, x1])
+        output = self.ff(x1, training=training)
 
         if return_attention_scores:
-            return x1, attention_scores
+            return output, attention_scores
         else:
-            return x1
+            return output
 
     def get_config(self):
-        config = super(TransformerSelfAttention, self).get_config()
+        config = super(SelfAttention, self).get_config()
         config.update({
             "num_heads": self.num_heads,
             "projection_units": self.projection_units,
             "epsilon": self.epsilon,
-            "dropout_rate": self.dropout_rate
-        })
-        return config
-
-
-class PerceiverBlock(layers.Layer):
-    def __init__(
-        self,
-        projection_units: "Optional[int]" = None,
-        num_heads: int = 1,
-        num_self_attention: int = 1,
-        epsilon: float = 1e-6,
-        cross_attention_kwargs: "Optional[Dict[str, Any]]" = None,
-        ff_kwargs: "Optional[Dict[str, Any]]" = None,
-        trans_kwargs: "Optional[Dict[str, Any]]" = None,
-        **kwargs
-    ):
-        super(PerceiverBlock, self).__init__(**kwargs)
-
-        self.projection_units = projection_units
-        self.num_heads = num_heads
-        self.num_self_attention = num_self_attention
-        self.epsilon = epsilon
-
-        if cross_attention_kwargs is None:
-            cross_attention_kwargs = {}
-        self.cross_attention_kwargs = cross_attention_kwargs
-        self.cross_attention = CrossAttention(
-            projection_units=projection_units,
-            name="cross_attention",
-            **cross_attention_kwargs
-        )
-
-        if ff_kwargs is None:
-            ff_kwargs = {
-                "inner_activation": SquareRelu(),
-                "epsilon": epsilon,
-                "dropout_rate": 0.5
-            }
-
-        self.ff_kwargs = ff_kwargs
-        self.ff0 = ResidualDense(
-            inner_units=projection_units,
-            name="ff_0",
-            **ff_kwargs
-        )
-
-        if trans_kwargs is None:
-            trans_kwargs = {}
-        self.trans_kwargs = trans_kwargs
-
-        self.transformer_attention = []
-        for i in range(num_self_attention):
-            i = i + 1
-            a = TransformerSelfAttention(
-                num_heads,
-                projection_units=projection_units,
-                epsilon=epsilon,
-                name=f"transformer_{i}",
-                **trans_kwargs
-            )
-            self.transformer_attention.append(a)
-            self.transformer_attention.append(ResidualDense(
-                inner_units=projection_units,
-                name=f"ff_{i}",
-                **ff_kwargs
-            ))
-
-        return
-
-    def build(self, input_shape):
-        X, latent = input_shape
-        self.input_spec = [
-            layers.InputSpec(shape=(None, None, self.projection_units)),
-            layers.InputSpec(shape=(None, None, latent[-1])),
-        ]
-        self.built = True
-        return
-
-    def call(self, X, training=False, return_attention_scores=False):
-        # Augment data.
-        data, latent = X
-        attentions = {}
-
-        if return_attention_scores:
-            latent, a = self.cross_attention(
-                (data, latent),
-                training=training,
-                return_attention_scores=return_attention_scores
-            )
-            attentions[self.cross_attention.name] = a
-        else:
-            latent = self.cross_attention(
-                (data, latent),
-                training=training,
-                return_attention_scores=return_attention_scores
-            )
-
-        latent = self.ff0(latent, training=training)
-        for transformer in self.transformer_attention:
-            if isinstance(transformer, TransformerSelfAttention):
-                if return_attention_scores:
-                    latent, a = transformer(
-                        latent,
-                        training=training,
-                        return_attention_scores=return_attention_scores
-                    )
-                    attentions[transformer.name] = a
-                else:
-                    latent = transformer(
-                        latent,
-                        training=training,
-                        return_attention_scores=False
-                    )
-            else:
-                latent = transformer(latent, training=training)
-
-        if return_attention_scores:
-            return latent, attentions
-        else:
-            return latent
-
-    def get_config(self):
-        config = super(PerceiverBlock, self).get_config()
-        config.update({
-            "projection_units": self.projection_units,
-            "num_heads": self.num_heads,
-            "num_self_attention": self.num_self_attention,
-            "epsilon": self.epsilon,
-            "cross_attention_kwargs": self.cross_attention_kwargs,
-            "ff_kwargs": self.ff_kwargs,
-            "trans_kwargs": self.trans_kwargs
-        })
-        return config
-
-
-class PerceiverDecoderBlock(layers.Layer):
-    def __init__(
-        self,
-        projection_units: "Optional[int]" = None,
-        epsilon: float = 1e-6,
-        cross_attention_kwargs: "Optional[Dict[str, Any]]" = None,
-        ff_kwargs: "Optional[Dict[str, Any]]" = None,
-        **kwargs,
-    ):
-        super(PerceiverDecoderBlock, self).__init__(**kwargs)
-
-        self.projection_units = projection_units
-        self.epsilon = epsilon
-
-        if cross_attention_kwargs is None:
-            cross_attention_kwargs = {}
-        self.cross_attention_kwargs = cross_attention_kwargs
-        self.cross_attention = CrossAttention(
-            projection_units=projection_units,
-            name="cross_attention",
-            **cross_attention_kwargs
-        )
-
-        if ff_kwargs is None:
-            ff_kwargs = {
-                "inner_activation": SquareRelu(),
-                "epsilon": epsilon,
-                "dropout_rate": 0.5
-            }
-
-        self.ff_kwargs = ff_kwargs
-        self.ff = ResidualDense(
-            inner_units=projection_units,
-            name="ff",
-            **ff_kwargs
-        )
-        return
-
-    def call(self, X, training=False, return_attention_scores=False):
-        # Augment data.
-        data, latent = X
-        # Note, the order is reversed to the encoder
-
-        if return_attention_scores:
-            data, a = self.cross_attention((latent, data), training=training)
-        else:
-            data = self.cross_attention((latent, data), training=training)
-            a = None
-        data = self.ff(data, training=training)
-
-        if return_attention_scores:
-            return data, a
-        else:
-            return data
-
-    def get_config(self):
-        config = super(PerceiverDecoderBlock, self).get_config()
-        config.update({
-            "projection_units": self.projection_units,
-            "epsilon": self.epsilon,
-            "cross_attention_kwargs": self.cross_attention_kwargs,
+            "dropout_rate": self.dropout_rate,
             "ff_kwargs": self.ff_kwargs
         })
         return config

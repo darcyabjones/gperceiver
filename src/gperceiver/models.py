@@ -3,117 +3,577 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Optional
+    from typing import Any, Optional, Union
+    from typing import Mapping
+    from typing import List
 #     import numpy.typing as npt
 
+import tensorflow as tf
 import tensorflow.keras as keras
 from tensorflow.keras import layers
+from tensorflow.keras import initializers, regularizers, constraints
 
 from .layers import (
-    LearnedLatent,
-    PerceiverBlock,
-    PerceiverDecoderBlock
+    SelfAttention,
+    CrossAttention,
+    SquareRelu
 )
 
 
-class PerceiverLatentInitialiser(keras.Model):
+class LatentInitialiser(keras.Model):
 
     def __init__(
         self,
-        output_dim: int,
-        latent_dim: int,
+        output_dim: "Optional[int]" = None,
+        latent_dim: "Optional[int]" = None,
+        initial_values=None,
+        latent_initializer='random_normal',
+        latent_regularizer=None,
+        activity_regularizer=None,
+        latent_constraint=None,
         **kwargs
     ):
-        super(PerceiverLatentInitialiser, self).__init__(**kwargs)
+        """ Constructs a 2D tensor of trainable weights.
 
-        self.output_dim = output_dim
+        Keyword arguments:
+          output_dim: the number of "channels" in the embedding.
+          latent_dim: the number of learned query vectors.
+                      The output matrix will be (batch, latent_dim, output_dim)
+        """
+
+        if (output_dim is None) and (latent_dim is None):
+            if initial_values is None:
+                raise ValueError(
+                    "Neither output_dim, latent_dim, nor "
+                    "initial_values were specified."
+                )
+
+            output_dim = tf.shape(initial_values)[0]
+            latent_dim = tf.shape(initial_values)[1]
+        else:
+            if (output_dim is None) or (latent_dim is None):
+                raise ValueError(
+                    "Both output_dim and latent_dim need to be specified"
+                )
+
+            if initial_values is not None:
+                if output_dim != tf.shape(initial_values)[0]:
+                    raise ValueError("Shapes aren't the same")
+
+                if latent_dim != tf.shape(initial_values)[1]:
+                    raise ValueError("Shapes aren't the same")
+
+        if latent_dim <= 0 or output_dim <= 0:
+            raise ValueError(
+                'Both `latent_dim` and `output_dim` should be positive, '
+                f'Received latent_dim = {latent_dim} and '
+                f'output_dim = {output_dim}'
+            )
+
+        kwargs["autocast"] = False
+        super(LatentInitialiser, self).__init__(**kwargs)
+
         self.latent_dim = latent_dim
-        self.latent_initializer = LearnedLatent(
-            output_dim=output_dim,
-            latent_dim=latent_dim
+        self.output_dim = output_dim
+        self.initial_values = initial_values
+
+        self.latent_initializer = initializers.get(latent_initializer)
+        self.latent_regularizer = regularizers.get(latent_regularizer)
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        self.latent_constraint = constraints.get(latent_constraint)
+        self.supports_masking = False
+
+        self.latent = self.add_weight(
+            shape=(self.latent_dim, self.output_dim),
+            initializer=self.latent_initializer,
+            name='latent',
+            regularizer=self.latent_regularizer,
+            constraint=self.latent_constraint,
+            experimental_autocast=False,
+            trainable=self.trainable
         )
+
+        if self.initial_values is not None:
+            self.latent.assign(self.initial_values)
         return
 
-    def call(
-        self,
-        X
-    ):
-        latent = self.latent_initializer(X)
+    def call(self, X):
+        latent = tf.expand_dims(self.latent, 0)
+        latent = tf.cast(latent, self.dtype)
+        latent = tf.repeat(latent, tf.shape(X)[0], axis=0)
         return latent
 
     def get_config(self):
-        config = super(PerceiverLatentInitialiser, self).get_config()
-        config["output_dim"] = self.output_dim
-        config["latent_dim"] = self.latent_dim
+        config = super(LatentInitialiser, self).get_config()
+        config.update({
+            "output_dim": self.output_dim,
+            "latent_dim": self.latent_dim,
+            "initial_values": self.initial_values,
+            'latent_initializer':
+                initializers.serialize(self.latent_initializer),
+            'latent_regularizer':
+                regularizers.serialize(self.latent_regularizer),
+            'activity_regularizer':
+                regularizers.serialize(self.activity_regularizer),
+            'latent_constraint':
+                constraints.serialize(self.latent_constraint),
+        })
         return config
 
 
-class PerceiverMarkerEncoder(keras.Model):
+class MarkerEmbedding(keras.Model):
 
     def __init__(
         self,
-        marker_encoder,
-        perceivers,
-        num_iterations=1,
-        **kwargs
+        nalleles: int,
+        npositions: int,
+        output_dim: int,
+        allele_embeddings_initializer="uniform",
+        allele_embeddings_regularizer=None,
+        allele_activity_regularizer=None,
+        allele_embeddings_constraint=None,
+        allele_mask_zero: bool = False,
+        allele_input_length=None,
+        position_embeddings_initializer="uniform",
+        position_embeddings_regularizer=None,
+        position_activity_regularizer=None,
+        position_embeddings_constraint=None,
+        position_mask_zero: bool = False,
+        position_input_length=None,
+        position_output_dim=None,
+        position_embeddings_trainable=False,
+        combine_method: str = "add",
+        **kwargs,
     ):
-        super(PerceiverMarkerEncoder, self).__init__(**kwargs)
+        kwargs["autocast"] = False
+        super(MarkerEmbedding, self).__init__(**kwargs)
 
-        self.marker_encoder = marker_encoder
+        self.nalleles = nalleles
+        self.npositions = npositions
+        self.output_dim = output_dim
 
-        if isinstance(perceivers, PerceiverBlock):
-            self.perceivers = [perceivers]
+        self.allele_embeddings_initializer = allele_embeddings_initializer
+        self.allele_embeddings_regularizer = allele_embeddings_regularizer
+        self.allele_activity_regularizer = allele_activity_regularizer
+        self.allele_embeddings_constraint = allele_embeddings_constraint
+        self.allele_mask_zero = allele_mask_zero
+        self.allele_input_length = allele_input_length
+        self.position_embeddings_initializer = position_embeddings_initializer
+        self.position_embeddings_regularizer = position_embeddings_regularizer
+        self.position_activity_regularizer = position_activity_regularizer
+        self.position_embeddings_constraint = position_embeddings_constraint
+        self.position_mask_zero = position_mask_zero
+        self.position_input_length = position_input_length
+        self.position_output_dim = position_output_dim
+        self.position_embeddings_trainable = position_embeddings_trainable
+
+        if position_output_dim is not None:
+            assert combine_method == "concat"
         else:
-            self.perceivers = perceivers
+            position_output_dim = output_dim
 
-        self.num_iterations = num_iterations
+        self.combine_method = combine_method
+
+        if combine_method == "add":
+            self.combiner = layers.Add(name="combiner")
+        elif combine_method == "concat":
+            self.combiner = layers.Concatenate(axis=-1, name="combiner")
+        else:
+            raise ValueError(
+                "Combine method must be either 'add' or 'concat'."
+            )
+
+        self.allele_embedder = layers.Embedding(
+            nalleles,
+            output_dim,
+            embeddings_initializer=allele_embeddings_initializer,
+            embeddings_regularizer=allele_embeddings_regularizer,
+            activity_regularizer=allele_activity_regularizer,
+            embeddings_constraint=allele_embeddings_constraint,
+            mask_zero=allele_mask_zero,
+            name="allele_embedder"
+        )
+        self.position_embedder = layers.Embedding(
+            npositions,
+            position_output_dim,
+            embeddings_initializer=position_embeddings_initializer,
+            embeddings_regularizer=position_embeddings_regularizer,
+            activity_regularizer=position_activity_regularizer,
+            embeddings_constraint=position_embeddings_constraint,
+            mask_zero=position_mask_zero,
+            trainable=position_embeddings_trainable,
+            name="position_embedder"
+        )
         return
 
-    def get_positional_encodings(self, X):
-        return self.marker_encoder.positional(X)
+    def call(self, X):
+        alleles, positions = X
+
+        alleles = self.allele_embedder(alleles)
+        positions = self.position_embedder(positions)
+        return self.combiner([alleles, positions])
+
+    def get_config(self):
+        config = super(MarkerEmbedding, self).get_config()
+        config.update({
+            "nalleles": self.nalleles,
+            "npositions": self.npositions,
+            "output_dim": self.output_dim,
+            "allele_embeddings_initializer": self.allele_embeddings_initializer,  # noqa
+            "allele_embeddings_regularizer": self.allele_embeddings_regularizer,  # noqa
+            "allele_activity_regularizer": self.allele_activity_regularizer,
+            "allele_embeddings_constraint": self.allele_embeddings_constraint,
+            "allele_mask_zero": self.allele_mask_zero,
+            "allele_input_length": self.allele_input_length,
+            "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
+            "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
+            "position_activity_regularizer": self.position_activity_regularizer,  # noqa
+            "position_embeddings_constraint": self.position_embeddings_constraint,  # noqa
+            "position_mask_zero": self.position_mask_zero,
+            "position_input_length": self.position_input_length,
+            "position_output_dim": self.position_output_dim,
+            "position_embeddings_trainable": self.position_embeddings_trainable,  # noqa
+            "combine_method": self.combine_method,
+        })
+        return config
+
+
+"""
+class PerceiverBlock(layers.Layer):
+    def __init__(
+        self,
+        projection_units: "Optional[int]" = None,
+        num_heads: int = 1,
+        num_self_attention: int = 1,
+        epsilon: float = 1e-6,
+        add_pos: bool = False,
+        cross_attention_kwargs: "Optional[Dict[str, Any]]" = None,
+        ff_kwargs: "Optional[Dict[str, Any]]" = None,
+        trans_kwargs: "Optional[Dict[str, Any]]" = None,
+        **kwargs
+    ):
+        super(PerceiverBlock, self).__init__(**kwargs)
+
+        self.projection_units = projection_units
+        self.num_heads = num_heads
+        self.num_self_attention = num_self_attention
+        self.epsilon = epsilon
+        self.add_pos = add_pos
+
+        self.ff_kwargs = ff_kwargs
+        if ff_kwargs is None:
+            ff_kwargs = {
+                "inner_activation": SquareRelu(),
+                "epsilon": epsilon,
+                "dropout_rate": 0.0
+            }
+
+        self.cross_attention_kwargs = cross_attention_kwargs
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs = {}
+
+        self.cross_attention = CrossAttention(
+            projection_units=projection_units,
+            name="cross_attention",
+            ff_kwargs=ff_kwargs,
+            add_pos=add_pos,
+            **cross_attention_kwargs
+        )
+
+        self.trans_kwargs = trans_kwargs
+        if trans_kwargs is None:
+            trans_kwargs = {}
+
+        self.transformer_attention = []
+        for i in range(num_self_attention):
+            i = i + 1
+            a = SelfAttention(
+                num_heads,
+                projection_units=projection_units,
+                epsilon=epsilon,
+                name=f"transformer_{i}",
+                ff_kwargs=ff_kwargs,
+                **trans_kwargs
+            )
+            self.transformer_attention.append(a)
+
+        return
 
     def call(
         self,
         inputs,
-        training: "Optional[bool]" = False,
-        return_attention_scores: "Optional[bool]" = False
+        mask=None,
+        training=False,
+        return_attention_scores=False
     ):
-        X, latent = inputs
-        markers = self.marker_encoder(X)
+        # Augment data.
+        latent = inputs[0]
+        data = inputs[1]
+        data_pos = inputs[2] if len(inputs) > 2 else None
 
-        attentions = {}
-        for i in range(self.num_iterations):
-            for perceiver in self.perceivers:
-                if return_attention_scores:
-                    latent, a = perceiver(
-                        [markers, latent],
-                        training=training,
-                        return_attention_scores=True
-                    )
-                    attentions.update({
-                        f"iter{i}/{k}": v
-                        for k, v
-                        in a.items()
-                    })
-
-                else:
-                    latent = perceiver([markers, latent], training=training)
-            i += 1
+        xattentions = []
+        sattentions = []
 
         if return_attention_scores:
-            return latent, attentions
+            latent, a = self.cross_attention(
+                (latent, data, None, data_pos),
+                mask=mask,
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+            xattentions.append(a)
+        else:
+            latent = self.cross_attention(
+                (latent, data, None, data_pos),
+                mask=mask,
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+
+        for transformer in self.transformer_attention:
+            if return_attention_scores:
+                latent, a = transformer(
+                    latent,
+                    training=training,
+                    return_attention_scores=return_attention_scores
+                )
+                sattentions.appent(a)
+            else:
+                latent = transformer(
+                    latent,
+                    training=training,
+                    return_attention_scores=False
+                )
+
+        if return_attention_scores:
+            return latent, xattentions, sattentions
         else:
             return latent
 
     def get_config(self):
-        config = super(PerceiverMarkerEncoder, self).get_config()
-        config["marker_encoder"] = self.marker_encoder.get_config()
-        config["perceivers"] = [
-            p.get_config()
-            for p
-            in self.perceivers
-        ]
+        config = super(PerceiverBlock, self).get_config()
+        config.update({
+            "projection_units": self.projection_units,
+            "num_heads": self.num_heads,
+            "num_self_attention": self.num_self_attention,
+            "epsilon": self.epsilon,
+            "add_pos": self.add_pos,
+            "cross_attention_kwargs": self.cross_attention_kwargs,
+            "ff_kwargs": self.ff_kwargs,
+            "trans_kwargs": self.trans_kwargs
+        })
+        return config
+"""
+
+
+class PerceiverEncoder(keras.Model):
+
+    def __init__(
+        self,
+        num_iterations: int,
+        projection_units: "Optional[int]" = None,
+        num_self_attention: int = 1,
+        num_self_attention_heads: int = 2,
+        epsilon: float = 1e-6,
+        add_pos: bool = False,
+        cross_attention_dropout: float = 0.1,
+        self_attention_dropout: float = 0.1,
+        share_weights: "Union[bool, str]" = "after_first",
+        ff_kwargs: "Optional[Mapping[str, Any]]" = None,
+        cross_attention_kwargs: "Optional[Mapping[str, Any]]" = None,
+        projection_kwargs: "Optional[Mapping[str, Any]]" = None,
+        self_attention_kwargs: "Optional[Mapping[str, Any]]" = None,
+        **kwargs
+    ):
+        super(PerceiverEncoder, self).__init__(**kwargs)
+
+        assert num_iterations > 0
+
+        if projection_units is not None:
+            assert projection_units > 0
+
+        self.num_iterations = num_iterations
+        self.projection_units = projection_units
+        self.num_self_attention_heads = num_self_attention_heads
+        self.num_self_attention = num_self_attention
+        self.epsilon = epsilon
+        self.add_pos = add_pos
+        self.cross_attention_dropout = cross_attention_dropout
+        self.self_attention_dropout = self_attention_dropout
+        self.share_weights = share_weights
+        assert share_weights in (True, False, "after_first", "after_first_xa")
+
+        if ff_kwargs is not None:
+            ff_kwargs = dict(ff_kwargs)
+        else:
+            ff_kwargs = {
+                "inner_activation": SquareRelu(),
+                "epsilon": epsilon,
+                "dropout_rate": 0.0
+            }
+
+        if cross_attention_kwargs is not None:
+            cross_attention_kwargs = dict(cross_attention_kwargs)
+        else:
+            cross_attention_kwargs = {}
+
+        if projection_kwargs is not None:
+            projection_kwargs = dict(projection_kwargs)
+        else:
+            projection_kwargs = {}
+
+        if self_attention_kwargs is not None:
+            self_attention_kwargs = dict(self_attention_kwargs)
+        else:
+            self_attention_kwargs = {}
+
+        self.ff_kwargs = ff_kwargs
+        self.cross_attention_kwargs = cross_attention_kwargs
+        self.projection_kwargs = projection_kwargs
+        self.self_attention_kwargs = self_attention_kwargs
+        return
+
+    def gen_xa(self, i: "Union[str,int]"):
+        return CrossAttention(
+            self.projection_units,
+            name=f"cross_attention_{i}",
+            epsilon=self.epsilon,
+            add_pos=self.add_pos,
+            dropout_rate=self.cross_attention_dropout,
+            ff_kwargs=self.ff_kwargs,
+            projection_kwargs=self.projection_kwargs,
+            **self.cross_attention_kwargs
+        )
+
+    def gen_sa(self, i: "Union[str,int]", j: "Union[str,int]"):
+        return SelfAttention(
+            num_heads=self.num_self_attention_heads,
+            projection_units=self.projection_units,
+            epsilon=self.epsilon,
+            dropout_rate=self.self_attention_dropout,
+            ff_kwargs=self.ff_kwargs,
+            name=f"self_attention_{i}_{j}",
+            **self.self_attention_kwargs
+        )
+
+    def build(self, input_shape):
+
+        if self.share_weights in ("after_first", "after_first_xa", True):
+            shared_sa_blocks = {
+                j: self.gen_sa("shared", j)
+                for j in range(1, self.num_self_attention + 1)
+            }
+
+            def gen_sa(i, j):
+                return shared_sa_blocks[j]
+
+            shared_xa_block = self.gen_xa("shared")
+
+            def gen_xa(i):
+                return shared_xa_block
+
+            if self.share_weights in ("after_first", "after_first_xa"):
+                def gen_first_xa(i):
+                    return self.gen_xa("1")
+            else:
+                gen_first_xa = gen_xa
+
+            if self.share_weights == "after_first_xa":
+                gen_first_sa = self.gen_sa
+            else:
+                gen_first_sa = gen_sa
+        else:
+            gen_sa = self.gen_sa
+            gen_xa = self.gen_xa
+            gen_first_sa = self.gen_sa
+            gen_first_xa = self.gen_xa
+
+        self.players = [gen_first_xa(1)]
+
+        for j in range(1, self.num_self_attention + 1):
+            self.players.append(gen_first_sa(1, j))
+
+        for i in range(2, self.num_iterations + 1):
+            self.players.append(gen_xa(i))
+
+            for j in range(1, self.num_self_attention + 1):
+                self.players.append(gen_sa(i, j))
+
+        self.built = True
+        return
+
+    def call(
+        self,
+        inputs,
+        mask: "Optional[Any]" = None,
+        training: "Optional[bool]" = False,
+        return_attention_scores: "Optional[bool]" = False
+    ):
+        latent = inputs[0]
+        data = inputs[1]
+        data_pos = inputs[2] if len(inputs) > 2 else None
+
+        xattentions: "List[tf.Tensor]" = []
+        sattentions: "List[tf.Tensor]" = []
+
+        for layer in self.players:
+            if isinstance(layer, CrossAttention):
+                if return_attention_scores:
+                    latent, a = layer(
+                        query=latent,
+                        key_value=data,
+                        key_pos=data_pos,
+                        mask=mask,
+                        training=training,
+                        return_attention_scores=return_attention_scores
+                    )
+                    xattentions.append(a)
+                else:
+                    latent = layer(
+                        query=latent,
+                        key_value=data,
+                        key_pos=data_pos,
+                        mask=mask,
+                        training=training,
+                        return_attention_scores=return_attention_scores
+                    )
+            elif isinstance(layer, SelfAttention):
+                if return_attention_scores:
+                    latent, a = layer(
+                        latent,
+                        training=training,
+                        return_attention_scores=return_attention_scores
+                    )
+                    sattentions.append(a)
+                else:
+                    latent = layer(
+                        latent,
+                        training=training,
+                        return_attention_scores=False
+                    )
+            else:
+                raise ValueError("Got unexpected layer")
+
+        if return_attention_scores:
+            return latent, xattentions, sattentions
+        else:
+            return latent
+
+    def get_config(self):
+        config = super(PerceiverEncoder, self).get_config()
         config["num_iterations"] = self.num_iterations
+        config["projection_units"] = self.projection_units
+        config["num_self_attention_heads"] = self.num_self_attention_heads
+        config["num_self_attention"] = self.num_self_attention
+        config["epsilon"] = self.epsilon
+        config["add_pos"] = self.add_pos
+        config["cross_attention_dropout"] = self.cross_attention_dropout
+        config["self_attention_dropout"] = self.self_attention_dropout
+        config["share_weights"] = self.share_weights
+        config["ff_kwargs"] = self.ff_kwargs
+        config["cross_attention_kwargs"] = self.cross_attention_kwargs
+        config["projection_kwargs"] = self.projection_kwargs
+        config["self_attention_kwargs"] = self.self_attention_kwargs
         return config
 
 
@@ -121,40 +581,89 @@ class PerceiverEncoderDecoder(keras.Model):
 
     def __init__(
         self,
-        latent_initialiser: PerceiverLatentInitialiser,
-        encoder: PerceiverMarkerEncoder,
-        decoder: PerceiverDecoderBlock,
+        latent_initialiser: LatentInitialiser,
+        marker_embedder: MarkerEmbedding,
+        encoder: PerceiverEncoder,
+        decoder: CrossAttention,
         predictor: layers.Layer,
+        relational_embedder: "Optional[layers.Layer]" = None,
         num_decode_iters: int = 1,
         **kwargs
     ):
         super(PerceiverEncoderDecoder, self).__init__(**kwargs)
         self.latent_initialiser = latent_initialiser
+        self.marker_embedder = marker_embedder
         self.encoder = encoder
         self.decoder = decoder
         self.num_decode_iters = num_decode_iters
         self.predictor = predictor
+        self.relational_embedder = relational_embedder
         return
 
     def call(
         self,
         X,
+        mask=None,
+        return_attention_scores: bool = False,
         training: "Optional[bool]" = False
     ):
-        latent = self.latent_initialiser(X)
-        latent = self.encoder([X, latent], training=False)
+        markers, all_pos, test_pos = X
 
-        preds = self.encoder.get_positional_encodings(X)
+        latent = self.latent_initialiser(markers)
+        markers = self.marker_embedder((markers, all_pos))
+
+        if self.relational_embedder is None:
+            encoded = self.encoder(
+                [latent, markers],
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+        else:
+            relational = self.relational_embedder(all_pos)
+            encoded = self.encoder(
+                [latent, markers, relational],
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+
+        if return_attention_scores:
+            encoded, xattention, sattention = encoded
+        else:
+            xattention = None
+            sattention = None
+
+        preds = self.marker_embedder.position_embedder(test_pos)
+        oattention = []
         for _ in range(self.num_decode_iters):
-            preds = self.decoder([preds, latent], training=training)
+            preds = self.decoder(
+                query=preds,
+                key_value=encoded,
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+
+            if return_attention_scores:
+                preds, oatt = preds
+                oattention.append(oatt)
+
         preds = self.predictor(preds)
-        return preds
+
+        if return_attention_scores:
+            return preds, xattention, sattention, oattention
+        else:
+            return preds
 
     def get_config(self):
         config = super(PerceiverEncoderDecoder, self).get_config()
         config["latent_initialiser"] = self.latent_initialiser.get_config()
+        config["marker_embedder"] = self.marker_embedder.get_config()
         config["encoder"] = self.marker_encoder.get_config()
         config["decoder"] = self.latent_initializer.get_config()
         config["predictor"] = self.predictor.get_config()
         config["num_decode_iters"] = self.num_decode_iters
+
+        if self.relational_embedder is None:
+            config["relational_embedder"] = None
+        else:
+            config["relational_embedder"] = self.relational_embedder.get_config()  # noqa
         return config
