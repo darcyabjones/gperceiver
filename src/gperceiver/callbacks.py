@@ -190,10 +190,12 @@ class SetTrainableAt(Callback):
         self,
         obj: "layers.Layer",
         epoch: int,
+        name: str
     ):
         super(SetTrainableAt, self).__init__()
         self.obj = obj
         self.epoch = epoch
+        self.name = name
         return
 
     def on_epoch_begin(
@@ -201,6 +203,9 @@ class SetTrainableAt(Callback):
         epoch: int,
         logs: "Optional[Dict[Any, Any]]" = None
     ):
+        logs = logs or {}
         if epoch >= self.epoch:
             self.obj.trainable = True
+
+        logs[f"{self.name}_trainable"] = int(self.obj.trainable)
         return

@@ -164,6 +164,18 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--position-embed-trainable",
+        type=int,
+        help=(
+            "How many epochs to wait before setting the "
+            "positional encodings to be trainable. "
+            "0 lets train from beginning, -1 (default)"
+            "means it wont ever be trainable."
+        ),
+        default=-1
+    )
+
+    parser.add_argument(
         "--projection-dim",
         type=int,
         help="The number of channels to use for attention comparisons",
@@ -320,11 +332,22 @@ def runner(args):  # noqa
     else:
         positions = None
 
-    with tf.device("/CPU:0"):
-        train = Dataset.from_tensor_slices(genos.values)
-        prep_aec = PrepAEC(offset=1, prop_ones=0.8)
+    train = Dataset.from_tensor_slices(genos.values)
+    prep_aec = PrepAEC(offset=1, prop_ones=0.8)
 
     del genos
+
+    # This stuff initialises it so that the encoder can take
+    # variable length sequences
+    lsize = [
+        layers.Input((None, args.output_dim)),
+        layers.Input((None, args.marker_embed_dim)),
+    ]
+
+    if args.relational_embed != "none":
+        lsize.append(
+            layers.Input((None, args.projection_dim))
+        )
 
     with strategy.scope():
         latent_initialiser = LatentInitialiser(
@@ -340,9 +363,10 @@ def runner(args):  # noqa
             position_embeddings_initializer=FourierEncoding(
                 positions=positions
             ),
-            position_embeddings_trainable=False,
+            position_embeddings_trainable=args.position_embed_trainable == 0,  # noqa
             name="prep_markers"
         )
+
         if args.relational_embed == "rsvd":
             rel_embed = layers.Embedding(
                 input_dim=nmarkers,
@@ -373,18 +397,7 @@ def runner(args):  # noqa
             name="encoder"
         )
 
-	# This stuff initialises it so that the encoder can take
-	# variable length sequences
-        lsize = [
-            layers.Input((None, args.output_dim)),
-            layers.Input((None, args.marker_embed_dim)),
-        ]
-
-        if args.relational_embed is not None:
-            lsize.append(
-                layers.Input((None, args.projection_dim))
-            )
-
+        # lsize was set out of scope
         encoder(lsize)
 
         decoder = CrossAttention(
@@ -448,7 +461,20 @@ def runner(args):  # noqa
         and (args.relational_embed_trainable > 0)
     ):
         callbacks.append(
-            SetTrainableAt(rel_embed, args.relational_embed_trainable)
+            SetTrainableAt(
+                rel_embed,
+                args.relational_embed_trainable,
+                "relational_embedder"
+            )
+        )
+
+    if args.position_embed_trainable > 0:
+        callbacks.append(
+            SetTrainableAt(
+                marker_embedding.position_embedder,
+                args.position_embed_trainable,
+                "position_embedder"
+            )
         )
 
     if args.logs is not None:
