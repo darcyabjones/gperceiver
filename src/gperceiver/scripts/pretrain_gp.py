@@ -283,6 +283,15 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--prop-dropped",
+        type=float,
+        help=(
+            "The proportion markers to drop out for prediction."
+        ),
+        default=0.1
+    )
+
+    parser.add_argument(
         "--use-linkage-positions",
         action="store_true",
         help="Use hamming distance for positional encodings.",
@@ -295,14 +304,52 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         help="Save a log file in tsv format",
         default=None
     )
+
+    parser.add_argument(
+        "--encoder-nontrainable",
+        action="store_true",
+        help="set the encoder to be non-trainable",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--decoder-nontrainable",
+        action="store_true",
+        help="set the decoder to be non-trainable",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--latent-nontrainable",
+        action="store_true",
+        help="set the latent to be non-trainable",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--marker-nontrainable",
+        action="store_true",
+        help="set the marker to be non-trainable",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--predictor-nontrainable",
+        action="store_true",
+        help="set the predictor to be non-trainable",
+        default=False,
+    )
+
     parsed = parser.parse_args(args)
 
     return parsed
 
 
 def runner(args):  # noqa
+    assert 0 < args.prop_dropped < 1
+
     if tf.config.list_physical_devices("GPU"):
-        strategy = tf.distribute.MirroredStrategy()
+        strategy = tf.distribute.MultiWorkerMirroredStrategy()
     else:
         strategy = tf.distribute.get_strategy()
 
@@ -333,7 +380,7 @@ def runner(args):  # noqa
         positions = None
 
     train = Dataset.from_tensor_slices(genos.values)
-    prep_aec = PrepAEC(offset=1, prop_ones=0.8)
+    prep_aec = PrepAEC(offset=1, prop_ones=1 - args.prop_dropped)
 
     del genos
 
@@ -435,6 +482,27 @@ def runner(args):  # noqa
     if args.checkpoint is not None:
         model1.load_weights(args.checkpoint)
 
+    if args.encoder_nontrainable:
+        model1.encoder.trainable = False
+
+    if args.decoder_nontrainable:
+        model1.decoder.trainable = False
+
+    if args.latent_nontrainable:
+        model1.latent_initialiser.trainable = False
+
+    if args.marker_nontrainable:
+        model1.marker_embedder.trainable = False
+
+    if args.predictor_nontrainable:
+        model1.predictor.trainable = False
+
+    if (args.relational_embed != "none") and (args.relational_embed_trainable == 0):
+        rel_embed.trainable = True
+
+    if args.position_embed_trainable == 0:
+        marker_embedding.position_embedder.trainable = True
+
     reduce_lr = ReduceLRWithWarmup(
         max_lr=args.lr,
         pre_warmup=args.pre_warmup_epochs,
@@ -442,9 +510,9 @@ def runner(args):  # noqa
         monitor='loss',
         factor=0.1,
         patience=args.reduce_lr_patience,
-        min_delta=1e-4,
+        min_delta=1e-3,
         cooldown=0,
-        min_lr=1e-16,
+        min_lr=1e-10,
     )
 
     # Create an early stopping callback.

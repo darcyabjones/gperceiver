@@ -582,7 +582,7 @@ class CrossAttention(layers.Layer):
             ff_kwargs = self.ff_kwargs
 
         self.ff = ResidualDense(
-            inner_units=self.projection_units,
+            inner_units=q_shape[-1],
             name="ff",
             **ff_kwargs
         )
@@ -734,7 +734,7 @@ class SelfAttention(layers.Layer):
             ff_kwargs = self.ff_kwargs
 
         self.ff = ResidualDense(
-            inner_units=self.projection_units,
+            inner_units=input_shape[-1],  # self.projection_units,
             name="ff",
             **ff_kwargs
         )
