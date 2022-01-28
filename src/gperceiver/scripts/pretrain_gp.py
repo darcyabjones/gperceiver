@@ -13,6 +13,8 @@ import tensorflow as tf
 from tensorflow.data import Dataset
 from tensorflow import keras
 from tensorflow.keras import layers
+from tensorflow.keras import regularizers
+from tensorflow.keras import initializers
 
 from tensorflow_addons.optimizers import LAMB
 
@@ -141,6 +143,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--marker-embed-dim",
         type=int,
         help="The number of dimensions for the per-marker learned embeddings",
+        default=4
+    )
+
+    parser.add_argument(
+        "--position-embed-dim",
+        type=int,
+        help="The number of dimensions for the position embeddings",
         default=128
     )
 
@@ -299,6 +308,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--use-random-positions",
+        action="store_true",
+        help="use randomly initialised positions to learn from",
+        default=False
+    )
+
+    parser.add_argument(
         "--logs",
         type=str,
         help="Save a log file in tsv format",
@@ -388,7 +404,7 @@ def runner(args):  # noqa
     # variable length sequences
     lsize = [
         layers.Input((None, args.output_dim)),
-        layers.Input((None, args.marker_embed_dim)),
+        layers.Input((None, args.marker_embed_dim + args.position_embed_dim)),
     ]
 
     if args.relational_embed != "none":
@@ -403,14 +419,23 @@ def runner(args):  # noqa
             name="latent"
         )
 
+        if args.use_random_positions:
+            pos_initialiser = initializers.TruncatedNormal()
+            pos_trainable = True
+        else:
+            pos_initialiser = FourierEncoding(positions=positions)
+            pos_trainable = args.position_embed_trainable == 0
+
         marker_embedding = MarkerEmbedding(
             nalleles=args.nalleles + 1,
             npositions=nmarkers,
             output_dim=args.marker_embed_dim,
-            position_embeddings_initializer=FourierEncoding(
-                positions=positions
-            ),
-            position_embeddings_trainable=args.position_embed_trainable == 0,  # noqa
+            position_output_dim=args.position_embed_dim,
+            combine_method="concat",
+            position_embeddings_initializer=pos_initialiser,
+            position_embeddings_trainable=pos_trainable,
+            allele_embeddings_regularizer=regularizers.L1L2(1e-10, 1e-10),
+            position_embeddings_regularizer=regularizers.L1L2(1e-10, 1e-10),
             name="prep_markers"
         )
 
@@ -427,7 +452,7 @@ def runner(args):  # noqa
             rel_embed = layers.Embedding(
                 input_dim=nmarkers,
                 output_dim=args.projection_dim,
-                embeddings_initializer="random_normal",
+                embeddings_initializer=initializers.TruncatedNormal(),
                 trainable=True,
                 name="relational_embedder"
             )
@@ -497,7 +522,10 @@ def runner(args):  # noqa
     if args.predictor_nontrainable:
         model1.predictor.trainable = False
 
-    if (args.relational_embed != "none") and (args.relational_embed_trainable == 0):
+    if (
+        (args.relational_embed != "none")
+        and (args.relational_embed_trainable == 0)
+    ):
         rel_embed.trainable = True
 
     if args.position_embed_trainable == 0:
@@ -615,8 +643,6 @@ def main():  # noqa
     except MemoryError:
         msg = (
             "Ran out of memory!\n"
-            "Catastrophy shouldn't use much RAM, so check other "
-            "processes and try running again."
         )
         print(msg, file=sys.stderr)
         sys.exit(EXIT_SYSERR)
@@ -631,8 +657,6 @@ def main():  # noqa
             "This shouldn't happen, so please file a bug report with the "
             "authors.\nWe will be extremely grateful!\n\n"
             "You can email us at {}.\n"
-            "Alternatively, you can file the issue directly on the repo "
-            "<https://github.com/darcyabjones/selectml/issues>\n\n"
             "Please attach a copy of the following message:"
         ).format(__email__)
         print(e, file=sys.stderr)

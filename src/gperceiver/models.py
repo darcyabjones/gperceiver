@@ -27,7 +27,7 @@ class LatentInitialiser(keras.Model):
         output_dim: "Optional[int]" = None,
         latent_dim: "Optional[int]" = None,
         initial_values=None,
-        latent_initializer='random_normal',
+        latent_initializer=initializers.TruncatedNormal(),
         latent_regularizer=None,
         activity_regularizer=None,
         latent_constraint=None,
@@ -128,6 +128,7 @@ class MarkerEmbedding(keras.Model):
         nalleles: int,
         npositions: int,
         output_dim: int,
+        position_output_dim: int,
         allele_embeddings_initializer="uniform",
         allele_embeddings_regularizer=None,
         allele_activity_regularizer=None,
@@ -140,9 +141,8 @@ class MarkerEmbedding(keras.Model):
         position_embeddings_constraint=None,
         position_mask_zero: bool = False,
         position_input_length=None,
-        position_output_dim=None,
         position_embeddings_trainable=False,
-        combine_method: str = "add",
+        combine_method: str = "concat",
         **kwargs,
     ):
         kwargs["autocast"] = False
@@ -184,7 +184,7 @@ class MarkerEmbedding(keras.Model):
             )
 
         self.allele_embedder = layers.Embedding(
-            nalleles,
+            nalleles * npositions,
             output_dim,
             embeddings_initializer=allele_embeddings_initializer,
             embeddings_regularizer=allele_embeddings_regularizer,
@@ -206,10 +206,18 @@ class MarkerEmbedding(keras.Model):
         )
         return
 
+    def calculate_position(self, alleles, positions):
+        positions = tf.cast(positions, tf.int64)
+        nalleles = tf.cast(self.nalleles, tf.int64)
+        alleles = tf.cast(alleles, tf.int64)
+        return (positions * nalleles) + alleles
+
     def call(self, X):
         alleles, positions = X
 
-        alleles = self.allele_embedder(alleles)
+        alleles = self.allele_embedder(
+            self.calculate_position(alleles, positions)
+        )
         positions = self.position_embedder(positions)
         return self.combiner([alleles, positions])
 
