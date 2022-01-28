@@ -135,6 +135,9 @@ class MarkerEmbedding(keras.Model):
         allele_embeddings_constraint=None,
         allele_mask_zero: bool = False,
         allele_input_length=None,
+        allele_scaler_initializer="ones",
+        allele_scaler_regularizer=None,
+        allele_scaler_constraint=None,
         position_embeddings_initializer="uniform",
         position_embeddings_regularizer=None,
         position_activity_regularizer=None,
@@ -158,6 +161,11 @@ class MarkerEmbedding(keras.Model):
         self.allele_embeddings_constraint = allele_embeddings_constraint
         self.allele_mask_zero = allele_mask_zero
         self.allele_input_length = allele_input_length
+
+        self.allele_scaler_initializer = allele_scaler_initializer
+        self.allele_scaler_regularizer = allele_scaler_regularizer
+        self.allele_scaler_constraint = allele_scaler_constraint
+
         self.position_embeddings_initializer = position_embeddings_initializer
         self.position_embeddings_regularizer = position_embeddings_regularizer
         self.position_activity_regularizer = position_activity_regularizer
@@ -184,7 +192,7 @@ class MarkerEmbedding(keras.Model):
             )
 
         self.allele_embedder = layers.Embedding(
-            nalleles * npositions,
+            nalleles,
             output_dim,
             embeddings_initializer=allele_embeddings_initializer,
             embeddings_regularizer=allele_embeddings_regularizer,
@@ -192,6 +200,15 @@ class MarkerEmbedding(keras.Model):
             embeddings_constraint=allele_embeddings_constraint,
             mask_zero=allele_mask_zero,
             name="allele_embedder"
+        )
+        self.allele_scaler = layers.Embedding(
+            nalleles,
+            output_dim,
+            embeddings_initializer=allele_scaler_initializer,
+            embeddings_regularizer=allele_scaler_regularizer,
+            embeddings_constraint=allele_scaler_constraint,
+            mask_zero=False,
+            name="allele_scaler"
         )
         self.position_embedder = layers.Embedding(
             npositions,
@@ -206,18 +223,10 @@ class MarkerEmbedding(keras.Model):
         )
         return
 
-    def calculate_position(self, alleles, positions):
-        positions = tf.cast(positions, tf.int64)
-        nalleles = tf.cast(self.nalleles, tf.int64)
-        alleles = tf.cast(alleles, tf.int64)
-        return (positions * nalleles) + alleles
-
     def call(self, X):
         alleles, positions = X
 
-        alleles = self.allele_embedder(
-            self.calculate_position(alleles, positions)
-        )
+        alleles = self.allele_embedder(alleles) * self.allele_scaler(positions)
         positions = self.position_embedder(positions)
         return self.combiner([alleles, positions])
 
@@ -233,6 +242,9 @@ class MarkerEmbedding(keras.Model):
             "allele_embeddings_constraint": self.allele_embeddings_constraint,
             "allele_mask_zero": self.allele_mask_zero,
             "allele_input_length": self.allele_input_length,
+            "allele_scaler_initializer": self.allele_scaler_initializer,
+            "allele_scaler_regularizer": self.allele_scaler_regularizer,
+            "allele_scaler_constraint": self.allele_scaler_constraint,
             "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
             "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
             "position_activity_regularizer": self.position_activity_regularizer,  # noqa

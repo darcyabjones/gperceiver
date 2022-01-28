@@ -37,7 +37,7 @@ from ..models import (
 
 from ..initializers import FourierEncoding, InitializeWithValues
 
-from ..callbacks import ReduceLRWithWarmup, SetTrainableAt
+from ..callbacks import ReduceLRWithWarmup
 
 __email__ = "darcy.ab.jones@gmail.com"
 
@@ -162,26 +162,33 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
 
     parser.add_argument(
         "--relational-embed-trainable",
-        type=int,
+        action="store_true",
         help=(
             "How many epochs to wait before setting the "
             "relational embeddings to be trainable. "
             "0 lets train from beginning, -1 (default)"
             "means it wont ever be trainable."
         ),
-        default=-1
+        default=False
     )
 
     parser.add_argument(
         "--position-embed-trainable",
-        type=int,
+        action="store_true",
         help=(
             "How many epochs to wait before setting the "
             "positional encodings to be trainable. "
             "0 lets train from beginning, -1 (default)"
             "means it wont ever be trainable."
         ),
-        default=-1
+        default=False
+    )
+
+    parser.add_argument(
+        "--share-weights",
+        choices=["after_first_xa", "true", "false", "after_first"],
+        default="after_first_xa",
+        help="Should we share weights between layers"
     )
 
     parser.add_argument(
@@ -412,6 +419,18 @@ def runner(args):  # noqa
             layers.Input((None, args.projection_dim))
         )
 
+    if args.use_random_positions:
+        args.position_embed_trainable = True
+
+    if args.relational_embed == "normal":
+        args.relational_embed_trainable = True
+
+    if args.share_weights == "true":
+        args.share_weights = True
+
+    elif args.share_weights == "false":
+        args.share_weights = False
+
     with strategy.scope():
         latent_initialiser = LatentInitialiser(
             args.output_dim,
@@ -421,10 +440,8 @@ def runner(args):  # noqa
 
         if args.use_random_positions:
             pos_initialiser = initializers.TruncatedNormal()
-            pos_trainable = True
         else:
             pos_initialiser = FourierEncoding(positions=positions)
-            pos_trainable = args.position_embed_trainable == 0
 
         marker_embedding = MarkerEmbedding(
             nalleles=args.nalleles + 1,
@@ -433,18 +450,18 @@ def runner(args):  # noqa
             position_output_dim=args.position_embed_dim,
             combine_method="concat",
             position_embeddings_initializer=pos_initialiser,
-            position_embeddings_trainable=pos_trainable,
-            allele_embeddings_regularizer=regularizers.L1L2(1e-10, 1e-10),
+            position_embeddings_trainable=args.position_embed_trainable,
+            allele_scaler_regularizer=regularizers.L1L2(1e-10, 1e-10),
             position_embeddings_regularizer=regularizers.L1L2(1e-10, 1e-10),
             name="prep_markers"
         )
 
-        if args.relational_embed == "rsvd":
+        if args.relational_embed == "tsvd":
             rel_embed = layers.Embedding(
                 input_dim=nmarkers,
                 output_dim=args.projection_dim,
                 embeddings_initializer=InitializeWithValues(values=pca),
-                trainable=args.relational_embed_trainable == 0,
+                trainable=args.relational_embed_trainable,
                 name="relational_embedder"
             )
             del pca
@@ -465,7 +482,7 @@ def runner(args):  # noqa
             num_self_attention=args.num_sa,
             num_self_attention_heads=args.num_sa_heads,
             add_pos=True,
-            share_weights="after_first_xa",
+            share_weights=args.share_weights,
             name="encoder"
         )
 
@@ -522,14 +539,9 @@ def runner(args):  # noqa
     if args.predictor_nontrainable:
         model1.predictor.trainable = False
 
-    if (
-        (args.relational_embed != "none")
-        and (args.relational_embed_trainable == 0)
-    ):
-        rel_embed.trainable = True
+    rel_embed.trainable = args.relational_embed_trainable
 
-    if args.position_embed_trainable == 0:
-        marker_embedding.position_embedder.trainable = True
+    marker_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
 
     reduce_lr = ReduceLRWithWarmup(
         max_lr=args.lr,
@@ -551,27 +563,6 @@ def runner(args):  # noqa
     )
 
     callbacks = [early_stopping, reduce_lr]
-
-    if (
-        (args.relational_embed == "tsvd")
-        and (args.relational_embed_trainable > 0)
-    ):
-        callbacks.append(
-            SetTrainableAt(
-                rel_embed,
-                args.relational_embed_trainable,
-                "relational_embedder"
-            )
-        )
-
-    if args.position_embed_trainable > 0:
-        callbacks.append(
-            SetTrainableAt(
-                marker_embedding.position_embedder,
-                args.position_embed_trainable,
-                "position_embedder"
-            )
-        )
 
     if args.logs is not None:
         callbacks.append(
