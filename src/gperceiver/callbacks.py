@@ -173,6 +173,7 @@ class ReduceLRWithWarmup(Callback):
                     backend.set_value(self.model.optimizer.lr, new_lr)
                     self.cooldown_counter = self.cooldown
                     self.wait = 0
+                    self.best = current  # S
 
     def in_pre_warmup(self):
         return self.pre_warmup_counter > 0

@@ -451,8 +451,8 @@ def runner(args):  # noqa
             combine_method="concat",
             position_embeddings_initializer=pos_initialiser,
             position_embeddings_trainable=args.position_embed_trainable,
-            allele_scaler_regularizer=regularizers.L1L2(1e-10, 1e-10),
-            position_embeddings_regularizer=regularizers.L1L2(1e-10, 1e-10),
+            allele_scaler_regularizer=regularizers.L1L2(1e-15, 1e-15),
+            #  position_embeddings_regularizer=regularizers.L2(1e-10),
             name="prep_markers"
         )
 
@@ -539,7 +539,8 @@ def runner(args):  # noqa
     if args.predictor_nontrainable:
         model1.predictor.trainable = False
 
-    rel_embed.trainable = args.relational_embed_trainable
+    if rel_embed is not None:
+        rel_embed.trainable = args.relational_embed_trainable
 
     marker_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
 
