@@ -3,9 +3,9 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from typing import Any, Optional
+    from typing import Any, Optional, Union
     from typing import Dict
-    # import numpy.typing as npt
+    import numpy.typing as npt
 
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -426,6 +426,185 @@ class CustomAttention(BaseDenseAttention):
         config = {'use_scale': self.use_scale, "add_pos": self.add_pos}
         base_config = super(CustomAttention, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
+
+
+class AlleleEmbedding(layers.Layer):
+
+    def __init__(
+        self,
+        nalleles: int,
+        npositions: int,
+        output_dim: int,
+        embeddings_initializer="uniform",
+        embeddings_regularizer=None,
+        embeddings_constraint=None,
+        **kwargs,
+    ):
+        kwargs["autocast"] = False
+        super(AlleleEmbedding, self).__init__(**kwargs)
+
+        self.nalleles = nalleles
+        self.npositions = npositions
+        self.output_dim = output_dim
+
+        self.embeddings_initializer = embeddings_initializer
+        self.embeddings_regularizer = embeddings_regularizer
+        self.embeddings_constraint = embeddings_constraint
+
+        self.allele_embedder = layers.Embedding(
+            nalleles * npositions,
+            output_dim,
+            embeddings_initializer=embeddings_initializer,
+            embeddings_regularizer=embeddings_regularizer,
+            embeddings_constraint=embeddings_constraint,
+            mask_zero=False,
+            name="allele_embedder"
+        )
+        return
+
+    def calculate_position(self, alleles, positions):
+        positions = tf.cast(positions, tf.int64)
+        nalleles = tf.cast(self.nalleles, tf.int64)
+        alleles = tf.cast(alleles, tf.int64)
+        return (positions * nalleles) + alleles
+
+    def call(self, X):
+        alleles, positions = X
+        allele_positions = self.calculate_position(alleles, positions)
+        return self.allele_embedder(allele_positions)
+
+    def get_config(self):
+        config = super(AlleleEmbedding, self).get_config()
+        config.update({
+            "nalleles": self.nalleles,
+            "npositions": self.npositions,
+            "output_dim": self.output_dim,
+            "embeddings_initializer": self.embeddings_initializer,
+            "embeddings_regularizer": self.embeddings_regularizer,
+            "embeddings_constraint": self.embeddings_constraint,
+        })
+        return config
+
+
+class PositionEmbedding(layers.Layer):
+
+    def __init__(
+        self,
+        positions: "Union[tf.Tensor, npt.ArrayLike]",
+        output_dim: int,
+        nchroms: "Optional[int]" = None,
+        chrom_output_dim: "Optional[int]" = None,
+        position_embeddings_regularizer=None,
+        position_embeddings_constraint=None,
+        position_embeddings_trainable=False,
+        chrom_embeddings_initializer="uniform",
+        chrom_embeddings_regularizer=None,
+        chrom_embeddings_constraint=None,
+        chrom_mask_zero: bool = False,
+        chrom_embeddings_trainable=False,
+        combine_method: str = "add",
+        **kwargs,
+    ):
+        from .initializers import InitializeWithValues
+
+        kwargs["autocast"] = False
+        super(PositionEmbedding, self).__init__(**kwargs)
+
+        self.positions = tf.convert_to_tensor(positions)
+        self.output_dim = output_dim
+        self.nchroms = nchroms
+
+        if chrom_output_dim is None:
+            chrom_output_dim = output_dim
+        self.chrom_output_dim = chrom_output_dim
+
+        if chrom_output_dim != output_dim:
+            assert combine_method == "concat"
+
+        self.position_embeddings_regularizer = position_embeddings_regularizer
+        self.position_embeddings_constraint = position_embeddings_constraint
+        self.position_embeddings_trainable = position_embeddings_trainable
+
+        self.chrom_embeddings_initializer = chrom_embeddings_initializer
+        self.chrom_embeddings_regularizer = chrom_embeddings_regularizer
+        self.chrom_embeddings_constraint = chrom_embeddings_constraint
+        self.chrom_mask_zero = chrom_mask_zero
+        self.chrom_embeddings_trainable = chrom_embeddings_trainable
+
+        self.combine_method = combine_method
+
+        if combine_method == "add":
+            self.combiner = layers.Add(name="combiner")
+        elif combine_method == "concat":
+            self.combiner = layers.Concatenate(axis=-1, name="combiner")
+        else:
+            raise ValueError(
+                "Combine method must be either 'add' or 'concat'."
+            )
+
+        self.position_embedder = layers.Embedding(
+            tf.size(self.positions),
+            1,
+            embeddings_initializer=InitializeWithValues(self.positions),
+            embeddings_regularizer=position_embeddings_regularizer,
+            embeddings_constraint=position_embeddings_constraint,
+            mask_zero=False,
+            trainable=position_embeddings_trainable,
+            name="position_embedder",
+            dtype=self.dtype
+        )
+
+        if nchroms is None:
+            self.chrom_embedder = None
+        else:
+            self.chrom_embedder = layers.Embedding(
+                nchroms,
+                chrom_output_dim,
+                embeddings_initializer=chrom_embeddings_initializer,
+                embeddings_regularizer=chrom_embeddings_regularizer,
+                embeddings_constraint=chrom_embeddings_constraint,
+                mask_zero=chrom_mask_zero,
+                trainable=chrom_embeddings_trainable,
+                name="chrom_embedder",
+                dtype=self.dtype
+            )
+        return
+
+    def get_positional_encoding(self, positions):
+        from .initializers import positional_encoding
+        return positional_encoding(
+            positions,
+            self.output_dim,
+            min_freq=1e-4,
+            dtype=self.dtype
+        )
+
+    def call(self, X):
+        chroms, positions = X
+        chroms = self.chrom_embedder(chroms)
+        positions = self.position_embedder(positions)
+        positions = self.get_positional_encoding(positions)
+        return self.combiner([chroms, positions])
+
+    def get_config(self):
+        config = super(PositionEmbedding, self).get_config()
+        config.update({
+            "npositions": self.npositions,
+            "output_dim": self.output_dim,
+            "nchroms": self.nchroms,
+            "chrom_output_dim": self.chrom_output_dim,
+            "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
+            "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
+            "position_embeddings_constraint": self.position_embeddings_constraint,  # noqa
+            "position_embeddings_trainable": self.position_embeddings_trainable,  # noqa
+            "chrom_embeddings_initializer": self.chrom_embeddings_initializer,  # noqa
+            "chrom_embeddings_regularizer": self.chrom_embeddings_regularizer,  # noqa
+            "chrom_embeddings_constraint": self.chrom_embeddings_constraint,  # noqa
+            "chrom_mask_zero": self.chrom_mask_zero,
+            "chrom_embeddings_trainable": self.chrom_embeddings_trainable,  # noqa
+            "combine_method": self.combine_method,
+        })
+        return config
 
 
 class CrossAttention(layers.Layer):

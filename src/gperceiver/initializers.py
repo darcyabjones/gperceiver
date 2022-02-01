@@ -26,11 +26,16 @@ def positional_encoding(
     cos_mask = 1 - sin_mask
     exponent = 2 * (mask // 2)
     exponent = (
-        tf.cast(exponent, tf.float32) /
+        tf.cast(exponent, dtype) /
         tf.cast(output_dim, dtype)
     )
     freqs = min_freq ** exponent
-    angles = tf.einsum('i,j->ij', position, freqs)
+
+    if len(tf.shape(position)) == 2:
+        angles = tf.einsum('bi,j->bij', position, freqs)
+    else:
+        angles = tf.einsum('i,j->ij', position, freqs)
+
     pos_enc = (
         (tf.math.cos(angles) * cos_mask) +
         (tf.math.sin(angles) * sin_mask)

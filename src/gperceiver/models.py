@@ -6,17 +6,21 @@ if TYPE_CHECKING:
     from typing import Any, Optional, Union
     from typing import Mapping
     from typing import List
-#     import numpy.typing as npt
+    #  import numpy.typing as npt
 
 import tensorflow as tf
 import tensorflow.keras as keras
 from tensorflow.keras import layers
+
+from tensorflow.keras.layers import Embedding
+
 from tensorflow.keras import initializers, regularizers, constraints
 
 from .layers import (
     SelfAttention,
     CrossAttention,
-    SquareRelu
+    SquareRelu,
+    AlleleEmbedding
 )
 
 
@@ -117,143 +121,6 @@ class LatentInitialiser(keras.Model):
                 regularizers.serialize(self.activity_regularizer),
             'latent_constraint':
                 constraints.serialize(self.latent_constraint),
-        })
-        return config
-
-
-class MarkerEmbedding(keras.Model):
-
-    def __init__(
-        self,
-        nalleles: int,
-        npositions: int,
-        output_dim: int,
-        position_output_dim: int,
-        allele_embeddings_initializer="uniform",
-        allele_embeddings_regularizer=None,
-        allele_activity_regularizer=None,
-        allele_embeddings_constraint=None,
-        allele_mask_zero: bool = False,
-        allele_input_length=None,
-        allele_scaler_initializer="ones",
-        allele_scaler_regularizer=None,
-        allele_scaler_constraint=None,
-        position_embeddings_initializer="uniform",
-        position_embeddings_regularizer=None,
-        position_activity_regularizer=None,
-        position_embeddings_constraint=None,
-        position_mask_zero: bool = False,
-        position_input_length=None,
-        position_embeddings_trainable=False,
-        combine_method: str = "concat",
-        **kwargs,
-    ):
-        kwargs["autocast"] = False
-        super(MarkerEmbedding, self).__init__(**kwargs)
-
-        self.nalleles = nalleles
-        self.npositions = npositions
-        self.output_dim = output_dim
-
-        self.allele_embeddings_initializer = allele_embeddings_initializer
-        self.allele_embeddings_regularizer = allele_embeddings_regularizer
-        self.allele_activity_regularizer = allele_activity_regularizer
-        self.allele_embeddings_constraint = allele_embeddings_constraint
-        self.allele_mask_zero = allele_mask_zero
-        self.allele_input_length = allele_input_length
-
-        self.allele_scaler_initializer = allele_scaler_initializer
-        self.allele_scaler_regularizer = allele_scaler_regularizer
-        self.allele_scaler_constraint = allele_scaler_constraint
-
-        self.position_embeddings_initializer = position_embeddings_initializer
-        self.position_embeddings_regularizer = position_embeddings_regularizer
-        self.position_activity_regularizer = position_activity_regularizer
-        self.position_embeddings_constraint = position_embeddings_constraint
-        self.position_mask_zero = position_mask_zero
-        self.position_input_length = position_input_length
-        self.position_output_dim = position_output_dim
-        self.position_embeddings_trainable = position_embeddings_trainable
-
-        if position_output_dim is not None:
-            assert combine_method == "concat"
-        else:
-            position_output_dim = output_dim
-
-        self.combine_method = combine_method
-
-        if combine_method == "add":
-            self.combiner = layers.Add(name="combiner")
-        elif combine_method == "concat":
-            self.combiner = layers.Concatenate(axis=-1, name="combiner")
-        else:
-            raise ValueError(
-                "Combine method must be either 'add' or 'concat'."
-            )
-
-        self.allele_embedder = layers.Embedding(
-            nalleles,
-            output_dim,
-            embeddings_initializer=allele_embeddings_initializer,
-            embeddings_regularizer=allele_embeddings_regularizer,
-            activity_regularizer=allele_activity_regularizer,
-            embeddings_constraint=allele_embeddings_constraint,
-            mask_zero=allele_mask_zero,
-            name="allele_embedder"
-        )
-        self.allele_scaler = layers.Embedding(
-            nalleles,
-            output_dim,
-            embeddings_initializer=allele_scaler_initializer,
-            embeddings_regularizer=allele_scaler_regularizer,
-            embeddings_constraint=allele_scaler_constraint,
-            mask_zero=False,
-            name="allele_scaler"
-        )
-        self.position_embedder = layers.Embedding(
-            npositions,
-            position_output_dim,
-            embeddings_initializer=position_embeddings_initializer,
-            embeddings_regularizer=position_embeddings_regularizer,
-            activity_regularizer=position_activity_regularizer,
-            embeddings_constraint=position_embeddings_constraint,
-            mask_zero=position_mask_zero,
-            trainable=position_embeddings_trainable,
-            name="position_embedder"
-        )
-        return
-
-    def call(self, X):
-        alleles, positions = X
-
-        alleles = self.allele_embedder(alleles) * self.allele_scaler(positions)
-        positions = self.position_embedder(positions)
-        return self.combiner([alleles, positions])
-
-    def get_config(self):
-        config = super(MarkerEmbedding, self).get_config()
-        config.update({
-            "nalleles": self.nalleles,
-            "npositions": self.npositions,
-            "output_dim": self.output_dim,
-            "allele_embeddings_initializer": self.allele_embeddings_initializer,  # noqa
-            "allele_embeddings_regularizer": self.allele_embeddings_regularizer,  # noqa
-            "allele_activity_regularizer": self.allele_activity_regularizer,
-            "allele_embeddings_constraint": self.allele_embeddings_constraint,
-            "allele_mask_zero": self.allele_mask_zero,
-            "allele_input_length": self.allele_input_length,
-            "allele_scaler_initializer": self.allele_scaler_initializer,
-            "allele_scaler_regularizer": self.allele_scaler_regularizer,
-            "allele_scaler_constraint": self.allele_scaler_constraint,
-            "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
-            "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
-            "position_activity_regularizer": self.position_activity_regularizer,  # noqa
-            "position_embeddings_constraint": self.position_embeddings_constraint,  # noqa
-            "position_mask_zero": self.position_mask_zero,
-            "position_input_length": self.position_input_length,
-            "position_output_dim": self.position_output_dim,
-            "position_embeddings_trainable": self.position_embeddings_trainable,  # noqa
-            "combine_method": self.combine_method,
         })
         return config
 
@@ -602,7 +469,7 @@ class PerceiverEncoderDecoder(keras.Model):
     def __init__(
         self,
         latent_initialiser: LatentInitialiser,
-        marker_embedder: MarkerEmbedding,
+        marker_embedder: "Union[AlleleEmbedding, Embedding]",
         encoder: PerceiverEncoder,
         decoder: CrossAttention,
         predictor: layers.Layer,
@@ -687,3 +554,18 @@ class PerceiverEncoderDecoder(keras.Model):
         else:
             config["relational_embedder"] = self.relational_embedder.get_config()  # noqa
         return config
+
+
+class PerceiverPredictor(object):
+
+    def __init__(self):
+        return
+
+    def call(self, X):
+        # New latents per env
+        # concat latents with new latents
+        # encode markers
+        # encoder([latent, markers])
+        # select env
+        # output_dense
+        return
