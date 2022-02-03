@@ -6,7 +6,6 @@ import argparse
 
 from typing import List
 
-import numpy as np
 import pandas as pd
 
 import tensorflow as tf
@@ -14,7 +13,6 @@ from tensorflow.data import Dataset
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras import regularizers
-from tensorflow.keras import initializers
 
 from tensorflow_addons.optimizers import LAMB
 
@@ -23,19 +21,18 @@ from .exitcodes import (
     EXIT_INPUT_NOT_FOUND, EXIT_SYSERR, EXIT_CANT_OUTPUT
 )
 
-from ..preprocessing import pairwise_correlation, PrepAEC
+from ..preprocessing import PrepAEC
 from ..layers import (
     CrossAttention,
 )
 
 from ..models import (
     LatentInitialiser,
-    MarkerEmbedding,
+    PositionEmbedding,
+    AlleleEmbedding,
     PerceiverEncoder,
     PerceiverEncoderDecoder,
 )
-
-from ..initializers import FourierEncoding, InitializeWithValues
 
 from ..callbacks import ReduceLRWithWarmup
 
@@ -82,6 +79,12 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
             f"{EXIT_CANT_OUTPUT} - Can't create output file\n"
             f"{EXIT_UNKNOWN} - Unhandled exception, please file a bug!\n"
         )
+    )
+
+    parser.add_argument(
+        "chroms",
+        type=argparse.FileType('r'),
+        help="The chromosomes and positions of the markers"
     )
 
     parser.add_argument(
@@ -150,26 +153,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--position-embed-dim",
         type=int,
         help="The number of dimensions for the position embeddings",
-        default=128
-    )
-
-    parser.add_argument(
-        "--relational-embed",
-        choices=["tsvd", "normal", "none"],
-        help="Add a relational embedding to the marker positions",
-        default="none"
-    )
-
-    parser.add_argument(
-        "--relational-embed-trainable",
-        action="store_true",
-        help=(
-            "How many epochs to wait before setting the "
-            "relational embeddings to be trainable. "
-            "0 lets train from beginning, -1 (default)"
-            "means it wont ever be trainable."
-        ),
-        default=False
+        default=256
     )
 
     parser.add_argument(
@@ -209,7 +193,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--output-dim",
         type=int,
         help="The number of channels to use in latent features",
-        default=128
+        default=256
     )
 
     parser.add_argument(
@@ -251,7 +235,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--warmup-epochs",
         type=int,
         help="The number of epochs to ramp up the learning rate",
-        default=9,
+        default=4,
     )
 
     parser.add_argument(
@@ -268,7 +252,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--batch-size",
         type=int,
         help="The batch size",
-        default=32
+        default=16
     )
 
     parser.add_argument(
@@ -305,20 +289,6 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
             "The proportion markers to drop out for prediction."
         ),
         default=0.1
-    )
-
-    parser.add_argument(
-        "--use-linkage-positions",
-        action="store_true",
-        help="Use hamming distance for positional encodings.",
-        default=False
-    )
-
-    parser.add_argument(
-        "--use-random-positions",
-        action="store_true",
-        help="use randomly initialised positions to learn from",
-        default=False
     )
 
     parser.add_argument(
@@ -376,31 +346,21 @@ def runner(args):  # noqa
     else:
         strategy = tf.distribute.get_strategy()
 
+    chroms = pd.read_csv(args.chroms, sep="\t")
+    assert list(genos.columns) == ["chrom", "marker", "pos"]
+
     genos = pd.read_csv(args.markers, sep="\t")
+    assert genos.columns[0] == "name"
     genos.set_index("name", inplace=True)
+
+    nchroms = genos["chrom"].nunique()
+    chroms = genos["chrom"].values
+    positions = tf.convert_to_tensor(genos["pos"].values, dtype=tf.float32)
+
+    genos = genos.iloc[:, 2:].values.T
 
     nmarkers = genos.shape[1]
     nsamples = genos.shape[0]
-
-    if args.relational_embed == "tsvd":
-        from sklearn.pipeline import Pipeline
-        from sklearn.decomposition import TruncatedSVD
-        from sklearn.preprocessing import RobustScaler
-
-        tsvd = Pipeline([
-            ("tsvd", TruncatedSVD(n_components=args.projection_dim)),
-            ("scaler", RobustScaler(quantile_range=(10.0, 90.0)))
-        ])
-        tsvd.fit(genos.T)
-        pca = tsvd.transform(genos.T)
-        del tsvd
-    else:
-        pca = None
-
-    if args.use_linkage_positions:
-        positions = np.cumsum(pairwise_correlation(genos.values))
-    else:
-        positions = None
 
     train = Dataset.from_tensor_slices(genos.values)
     prep_aec = PrepAEC(offset=1, prop_ones=1 - args.prop_dropped)
@@ -413,17 +373,6 @@ def runner(args):  # noqa
         layers.Input((None, args.output_dim)),
         layers.Input((None, args.marker_embed_dim + args.position_embed_dim)),
     ]
-
-    if args.relational_embed != "none":
-        lsize.append(
-            layers.Input((None, args.projection_dim))
-        )
-
-    if args.use_random_positions:
-        args.position_embed_trainable = True
-
-    if args.relational_embed == "normal":
-        args.relational_embed_trainable = True
 
     if args.share_weights == "true":
         args.share_weights = True
@@ -438,43 +387,21 @@ def runner(args):  # noqa
             name="latent"
         )
 
-        if args.use_random_positions:
-            pos_initialiser = initializers.TruncatedNormal()
-        else:
-            pos_initialiser = FourierEncoding(positions=positions)
+        position_embedding = PositionEmbedding(
+            positions=positions,
+            nchroms=nchroms if nchroms > 1 else None,
+            output_dim=args.position_embed_dim,
+            position_embeddings_trainable=args.position_embed_trainable,
+            name="position_embedding",
+        )
 
-        marker_embedding = MarkerEmbedding(
+        allele_embedding = AlleleEmbedding(
             nalleles=args.nalleles + 1,
             npositions=nmarkers,
             output_dim=args.marker_embed_dim,
-            position_output_dim=args.position_embed_dim,
-            combine_method="concat",
-            position_embeddings_initializer=pos_initialiser,
-            position_embeddings_trainable=args.position_embed_trainable,
-            allele_scaler_regularizer=regularizers.L1L2(1e-15, 1e-15),
-            #  position_embeddings_regularizer=regularizers.L2(1e-10),
-            name="prep_markers"
+            embeddings_regularizer=regularizers.L2(1e-10),
+            name="allele_embedding"
         )
-
-        if args.relational_embed == "tsvd":
-            rel_embed = layers.Embedding(
-                input_dim=nmarkers,
-                output_dim=args.projection_dim,
-                embeddings_initializer=InitializeWithValues(values=pca),
-                trainable=args.relational_embed_trainable,
-                name="relational_embedder"
-            )
-            del pca
-        elif args.relational_embed == "normal":
-            rel_embed = layers.Embedding(
-                input_dim=nmarkers,
-                output_dim=args.projection_dim,
-                embeddings_initializer=initializers.TruncatedNormal(),
-                trainable=True,
-                name="relational_embedder"
-            )
-        else:
-            rel_embed = None
 
         encoder = PerceiverEncoder(
             num_iterations=args.num_encode_iters,
@@ -501,11 +428,12 @@ def runner(args):  # noqa
 
         model1 = PerceiverEncoderDecoder(
             latent_initialiser=latent_initialiser,
-            marker_embedder=marker_embedding,
+            position_embedder=position_embedding,
+            allele_embedder=allele_embedding,
             encoder=encoder,
             decoder=decoder,
             predictor=predictor,
-            relational_embedder=rel_embed,
+            relational_embedder=None,
             num_decode_iters=args.num_decode_iters,
             name="encoder_decoder"
         )
@@ -539,10 +467,7 @@ def runner(args):  # noqa
     if args.predictor_nontrainable:
         model1.predictor.trainable = False
 
-    if rel_embed is not None:
-        rel_embed.trainable = args.relational_embed_trainable
-
-    marker_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
+    position_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
 
     reduce_lr = ReduceLRWithWarmup(
         max_lr=args.lr,
@@ -596,7 +521,7 @@ def runner(args):  # noqa
 
     # Fit the model.
     model1.fit(
-        train.shuffle(nsamples).map(prep_aec).batch(batch_size),
+        train.shuffle(nsamples).batch(batch_size).map(prep_aec),
         epochs=args.nepochs + args.warmup_epochs + args.pre_warmup_epochs,
         callbacks=callbacks,
         verbose=1

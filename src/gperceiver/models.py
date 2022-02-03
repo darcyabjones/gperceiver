@@ -20,7 +20,8 @@ from .layers import (
     SelfAttention,
     CrossAttention,
     SquareRelu,
-    AlleleEmbedding
+    AlleleEmbedding,
+    PositionEmbedding
 )
 
 
@@ -469,7 +470,8 @@ class PerceiverEncoderDecoder(keras.Model):
     def __init__(
         self,
         latent_initialiser: LatentInitialiser,
-        marker_embedder: "Union[AlleleEmbedding, Embedding]",
+        position_embedder: "Union[PositionEmbedding, Embedding]",
+        allele_embedder: "Union[AlleleEmbedding, Embedding]",
         encoder: PerceiverEncoder,
         decoder: CrossAttention,
         predictor: layers.Layer,
@@ -479,12 +481,15 @@ class PerceiverEncoderDecoder(keras.Model):
     ):
         super(PerceiverEncoderDecoder, self).__init__(**kwargs)
         self.latent_initialiser = latent_initialiser
-        self.marker_embedder = marker_embedder
+        self.position_embedder = position_embedder
+        self.allele_embedder = allele_embedder
         self.encoder = encoder
         self.decoder = decoder
         self.num_decode_iters = num_decode_iters
         self.predictor = predictor
         self.relational_embedder = relational_embedder
+        self.concat = layers.Concatenate()
+        self.flatten = layers.Flatten()
         return
 
     def call(
@@ -497,7 +502,9 @@ class PerceiverEncoderDecoder(keras.Model):
         markers, all_pos, test_pos = X
 
         latent = self.latent_initialiser(markers)
-        markers = self.marker_embedder((markers, all_pos))
+        positions = self.position_embedder(all_pos)
+        alleles = self.allele_embedder((markers, all_pos))
+        markers = self.concat([alleles, positions])
 
         if self.relational_embedder is None:
             encoded = self.encoder(
@@ -519,7 +526,7 @@ class PerceiverEncoderDecoder(keras.Model):
             xattention = None
             sattention = None
 
-        preds = self.marker_embedder.position_embedder(test_pos)
+        preds = self.position_embedder(test_pos)
         oattention = []
         for _ in range(self.num_decode_iters):
             preds = self.decoder(
@@ -534,6 +541,7 @@ class PerceiverEncoderDecoder(keras.Model):
                 oattention.append(oatt)
 
         preds = self.predictor(preds)
+        # preds = self.flatten(preds)
 
         if return_attention_scores:
             return preds, xattention, sattention, oattention

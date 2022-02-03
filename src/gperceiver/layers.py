@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 import tensorflow as tf
 from tensorflow.keras import layers
+from tensorflow.keras import activations
 from tensorflow.python.keras.layers.dense_attention import BaseDenseAttention
 
 
@@ -438,10 +439,132 @@ class AlleleEmbedding(layers.Layer):
         embeddings_initializer="uniform",
         embeddings_regularizer=None,
         embeddings_constraint=None,
+        kernel_initializer="uniform",
+        kernel_regularizer=None,
+        kernel_constraint=None,
+        bias_initializer="zeros",
+        bias_regularizer=None,
+        bias_constraint=None,
+        activity_regularizer=None,
+        activation=None,
         **kwargs,
     ):
         kwargs["autocast"] = False
-        super(AlleleEmbedding, self).__init__(**kwargs)
+        super(AlleleEmbedding, self).__init__(
+            activity_regularizer=activity_regularizer,
+            **kwargs
+        )
+
+        self.nalleles = nalleles
+        self.npositions = npositions
+        self.output_dim = output_dim
+
+        self.embeddings_initializer = embeddings_initializer
+        self.embeddings_regularizer = embeddings_regularizer
+        self.embeddings_constraint = embeddings_constraint
+
+        self.kernel_initializer = kernel_initializer
+        self.kernel_regularizer = kernel_regularizer
+        self.kernel_constraint = kernel_constraint
+        self.bias_initializer = bias_initializer
+        self.bias_regularizer = bias_regularizer
+        self.bias_constraint = bias_constraint
+        self.activity_regularizer = activity_regularizer
+        self.activation = activation
+
+        self.allele_embedder = layers.Embedding(
+            nalleles,
+            output_dim,
+            embeddings_initializer=embeddings_initializer,
+            embeddings_regularizer=embeddings_regularizer,
+            embeddings_constraint=embeddings_constraint,
+            mask_zero=False,
+            name="allele_embedder"
+        )
+
+        self.kernel = layers.Embedding(
+            npositions,
+            output_dim * output_dim,
+            embeddings_initializer=kernel_initializer,
+            embeddings_regularizer=kernel_regularizer,
+            embeddings_constraint=kernel_constraint,
+            mask_zero=False,
+            name="kernel",
+        )
+
+        self.reshaper = layers.Reshape((output_dim, output_dim))
+
+        self.bias = layers.Embedding(
+            npositions,
+            output_dim,
+            embeddings_initializer=bias_initializer,
+            embeddings_regularizer=bias_regularizer,
+            embeddings_constraint=bias_constraint,
+            mask_zero=False,
+            name="bias"
+        )
+
+        self.activation = activations.get(activation)
+        return
+
+    def call(self, X):
+        alleles, positions = X
+        alleles = self.allele_embedder(alleles)
+        alleles = tf.reduce_sum(alleles, axis=-2)
+        alleles = tf.expand_dims(alleles, -2)
+
+        kernel = self.kernel(positions)
+        kshape = tf.shape(kernel)
+        kernel = tf.reshape(
+            kernel,
+            (kshape[0], kshape[1], self.output_dim, self.output_dim)
+        )
+        bias = self.bias(positions)
+        kdota = tf.matmul(alleles, kernel)
+        kshape = tf.shape(kdota)
+        kdota = tf.reshape(kdota, (kshape[0], kshape[1], kshape[-1]))
+
+        values = kdota + bias
+        if self.activation is not None:
+            values = self.activation(values)
+
+        return values
+
+    def get_config(self):
+        config = super(AlleleEmbedding, self).get_config()
+        config.update({
+            "nalleles": self.nalleles,
+            "npositions": self.npositions,
+            "output_dim": self.output_dim,
+            "embeddings_initializer": self.embeddings_initializer,
+            "embeddings_regularizer": self.embeddings_regularizer,
+            "embeddings_constraint": self.embeddings_constraint,
+            "kernel_initializer": self.kernel_initializer,
+            "kernel_regularizer": self.kernel_regularizer,
+            "kernel_constraint": self.kernel_constraint,
+            "bias_initializer": self.bias_initializer,
+            "bias_regularizer": self.bias_regularizer,
+            "bias_constraint": self.bias_constraint,
+            "activity_regularizer": self.activity_regularizer,
+            "activation": activations.serialize(self.activation),
+        })
+        return config
+
+
+class AlleleEmbedding2(layers.Layer):
+
+    def __init__(
+        self,
+        nalleles: int,
+        npositions: int,
+        output_dim: int,
+        embeddings_initializer="uniform",
+        embeddings_regularizer=None,
+        embeddings_constraint=None,
+        **kwargs,
+    ):
+        kwargs["autocast"] = False
+        super(AlleleEmbedding2, self).__init__(**kwargs)
 
         self.nalleles = nalleles
         self.npositions = npositions
@@ -464,6 +587,7 @@ class AlleleEmbedding(layers.Layer):
 
     def calculate_position(self, alleles, positions):
         positions = tf.cast(positions, tf.int64)
+        positions = tf.expand_dims(positions, -1)
         nalleles = tf.cast(self.nalleles, tf.int64)
         alleles = tf.cast(alleles, tf.int64)
         return (positions * nalleles) + alleles
@@ -471,10 +595,11 @@ class AlleleEmbedding(layers.Layer):
     def call(self, X):
         alleles, positions = X
         allele_positions = self.calculate_position(alleles, positions)
-        return self.allele_embedder(allele_positions)
+        allele_embedding = self.allele_embedder(allele_positions)
+        return tf.reduce_sum(allele_embedding, axis=-2)
 
     def get_config(self):
-        config = super(AlleleEmbedding, self).get_config()
+        config = super(AlleleEmbedding2, self).get_config()
         config.update({
             "nalleles": self.nalleles,
             "npositions": self.npositions,
@@ -490,9 +615,143 @@ class PositionEmbedding(layers.Layer):
 
     def __init__(
         self,
+        npositions: int,
+        output_dim: int,
+        chroms: "Union[tf.Tensor, npt.ArrayLike, None]" = None,
+        nchroms: "Optional[int]" = None,
+        chrom_output_dim: "Optional[int]" = None,
+        position_embeddings_initializer="uniform",
+        position_embeddings_regularizer=None,
+        position_embeddings_constraint=None,
+        position_embeddings_trainable=True,
+        position_mask_zero: bool = False,
+        chrom_embeddings_initializer="uniform",
+        chrom_embeddings_regularizer=None,
+        chrom_embeddings_constraint=None,
+        chrom_mask_zero: bool = False,
+        chrom_embeddings_trainable=True,
+        combine_method: str = "add",
+        **kwargs,
+    ):
+        kwargs["autocast"] = False
+        super(PositionEmbedding, self).__init__(**kwargs)
+
+        self.output_dim = output_dim
+
+        if chroms is None:
+            self.chroms = chroms
+        else:
+            self.chroms = tf.convert_to_tensor(chroms, dtype=tf.int64)
+
+        if self.chroms is None:
+            nchroms = None
+        else:
+            nchroms = tf.size(tf.unique(self.chroms).y)
+
+        if chrom_output_dim is None:
+            chrom_output_dim = output_dim
+        self.chrom_output_dim = chrom_output_dim
+
+        if chrom_output_dim != output_dim:
+            assert combine_method == "concat"
+
+        self.position_embeddings_initializer = position_embeddings_initializer
+        self.position_embeddings_regularizer = position_embeddings_regularizer
+        self.position_embeddings_constraint = position_embeddings_constraint
+        self.position_mask_zero = position_mask_zero
+        self.position_embeddings_trainable = position_embeddings_trainable
+
+        self.chrom_embeddings_initializer = chrom_embeddings_initializer
+        self.chrom_embeddings_regularizer = chrom_embeddings_regularizer
+        self.chrom_embeddings_constraint = chrom_embeddings_constraint
+        self.chrom_mask_zero = chrom_mask_zero
+        self.chrom_embeddings_trainable = chrom_embeddings_trainable
+
+        self.combine_method = combine_method
+
+        if combine_method == "add":
+            self.combiner = layers.Add(name="combiner")
+        elif combine_method == "concat":
+            self.combiner = layers.Concatenate(axis=-1, name="combiner")
+        else:
+            raise ValueError(
+                "Combine method must be either 'add' or 'concat'."
+            )
+
+        self.position_embedder = layers.Embedding(
+            npositions,
+            output_dim,
+            embeddings_initializer=position_embeddings_initializer,
+            embeddings_regularizer=position_embeddings_regularizer,
+            embeddings_constraint=position_embeddings_constraint,
+            mask_zero=position_mask_zero,
+            trainable=position_embeddings_trainable,
+            name="position_embedder",
+            dtype=self.dtype
+        )
+
+        if nchroms is None:
+            self.chrom_embedder = None
+        else:
+            self.chrom_embedder = layers.Embedding(
+                nchroms,
+                chrom_output_dim,
+                embeddings_initializer=chrom_embeddings_initializer,
+                embeddings_regularizer=chrom_embeddings_regularizer,
+                embeddings_constraint=chrom_embeddings_constraint,
+                mask_zero=chrom_mask_zero,
+                trainable=chrom_embeddings_trainable,
+                name="chrom_embedder",
+                dtype=self.dtype
+            )
+        return
+
+    def call(self, X):
+
+        if self.chrom_embedder is None:
+            positions = X
+            chroms = None
+        else:
+            positions = X
+            chroms = tf.gather(self.chroms, positions)
+
+        positions = self.position_embedder(positions)
+
+        if (chroms is not None) and (self.chrom_embedder is not None):
+            chroms = self.chrom_embedder(chroms)
+            return self.combiner([chroms, positions])
+        else:
+            return positions
+
+    def get_config(self):
+        config = super(PositionEmbedding, self).get_config()
+        config.update({
+            "npositions": self.npositions,
+            "output_dim": self.output_dim,
+            "chroms": self.chroms,
+            "chrom_output_dim": self.chrom_output_dim,
+            "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
+            "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
+            "position_embeddings_constraint": self.position_embeddings_constraint,  # noqa
+            "position_mask_zero": self.position_mask_zero,
+            "position_embeddings_trainable": self.position_embeddings_trainable,  # noqa
+            "chrom_embeddings_initializer": self.chrom_embeddings_initializer,  # noqa
+            "chrom_embeddings_regularizer": self.chrom_embeddings_regularizer,  # noqa
+            "chrom_embeddings_constraint": self.chrom_embeddings_constraint,  # noqa
+            "chrom_mask_zero": self.chrom_mask_zero,
+            "chrom_embeddings_trainable": self.chrom_embeddings_trainable,  # noqa
+            "combine_method": self.combine_method,
+        })
+        return config
+
+
+class FourierPositionEmbedding(layers.Layer):
+
+    def __init__(
+        self,
         positions: "Union[tf.Tensor, npt.ArrayLike]",
         output_dim: int,
-        nchroms: "Optional[int]" = None,
+        chroms: "Union[tf.Tensor, npt.ArrayLike, None]" = None,
         chrom_output_dim: "Optional[int]" = None,
         position_embeddings_regularizer=None,
         position_embeddings_constraint=None,
@@ -508,11 +767,23 @@ class PositionEmbedding(layers.Layer):
         from .initializers import InitializeWithValues
 
         kwargs["autocast"] = False
-        super(PositionEmbedding, self).__init__(**kwargs)
+        super(FourierPositionEmbedding, self).__init__(**kwargs)
 
-        self.positions = tf.convert_to_tensor(positions)
+        self.positions = tf.expand_dims(
+            tf.convert_to_tensor(positions, dtype=tf.float32),
+            -1
+        )
         self.output_dim = output_dim
-        self.nchroms = nchroms
+
+        if chroms is None:
+            self.chroms = chroms
+        else:
+            self.chroms = tf.convert_to_tensor(chroms, dtype=tf.int64)
+
+        if self.chroms is None:
+            nchroms = None
+        else:
+            nchroms = tf.size(tf.unique(self.chroms).y)
 
         if chrom_output_dim is None:
             chrom_output_dim = output_dim
@@ -573,25 +844,36 @@ class PositionEmbedding(layers.Layer):
     def get_positional_encoding(self, positions):
         from .initializers import positional_encoding
         return positional_encoding(
-            positions,
+            positions[:, :, 0],
             self.output_dim,
             min_freq=1e-4,
             dtype=self.dtype
         )
 
     def call(self, X):
-        chroms, positions = X
-        chroms = self.chrom_embedder(chroms)
+
+        if self.chrom_embedder is None:
+            positions = X
+            chroms = None
+        else:
+            positions = X
+            chroms = tf.gather(self.chroms, positions)
+
         positions = self.position_embedder(positions)
         positions = self.get_positional_encoding(positions)
-        return self.combiner([chroms, positions])
+
+        if (chroms is not None) and (self.chrom_embedder is not None):
+            chroms = self.chrom_embedder(chroms)
+            return self.combiner([chroms, positions])
+        else:
+            return positions
 
     def get_config(self):
-        config = super(PositionEmbedding, self).get_config()
+        config = super(FourierPositionEmbedding, self).get_config()
         config.update({
             "npositions": self.npositions,
             "output_dim": self.output_dim,
-            "nchroms": self.nchroms,
+            "chroms": self.chroms,
             "chrom_output_dim": self.chrom_output_dim,
             "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
             "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
