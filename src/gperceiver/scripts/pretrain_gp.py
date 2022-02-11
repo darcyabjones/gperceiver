@@ -154,7 +154,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--marker-embed-dim",
         type=int,
         help="The number of dimensions for the per-marker learned embeddings",
-        default=4
+        default=256
     )
 
     parser.add_argument(
@@ -319,7 +319,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         help=(
             "The proportion of markers to predict."
         ),
-        default=1.0
+        default=0.1
     )
 
     parser.add_argument(
@@ -379,6 +379,13 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--ploidy-scaler",
+        type=float,
+        default=1.0,
+        help="Weight ploidy penalty by this amount."
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -391,10 +398,11 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
 
 
 def runner(args):  # noqa
-    assert 0 < args.prop_dropped < 1
+    assert 0 < args.prop_x <= 1
+    assert 0 < args.prop_y < 1
 
     if args.allele_combiner == "add":
-        assert args.marker_embed_dim == args.marker_embed_dim
+        assert args.marker_embed_dim == args.position_embed_dim
 
     if tf.config.list_physical_devices("GPU"):
         strategy = tf.distribute.MultiWorkerMirroredStrategy()

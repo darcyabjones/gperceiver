@@ -383,7 +383,7 @@ class PerceiverEncoderDecoder(keras.Model):
         x_position_embeddings = self.position_embedder(x_pos)
 
         if isinstance(self.allele_embedder, layers.Embedding):
-            alleles = self.allele_embedder(X)
+            alleles = self.allele_embedder(markers)
             alleles = tf.reduce_sum(alleles, axis=-2)
         else:
             alleles = self.allele_embedder((markers, x_pos))

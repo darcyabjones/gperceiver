@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from typing import List
+    from typing import Optional
 
 import numpy as np
 import tensorflow as tf
@@ -230,7 +231,7 @@ class PrepAEC(object):
             num_to_sample = new_num_to_sample
             del new_num_to_sample
         else:
-            remaining = 0
+            remaining = tf.cast(0, tf.int64)
 
         indices = tf.gather(candidates, tf.range(num_to_sample))
 
