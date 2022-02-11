@@ -590,6 +590,7 @@ class AlleleEmbedding2(layers.Layer):
         positions = tf.expand_dims(positions, -1)
         nalleles = tf.cast(self.nalleles, tf.int64)
         alleles = tf.cast(alleles, tf.int64)
+
         return (positions * nalleles) + alleles
 
     def call(self, X):
@@ -1035,7 +1036,7 @@ class CrossAttention(layers.Layer):
 
         if self.ff_kwargs is None:
             ff_kwargs = {
-                "inner_activation": SquareRelu(),
+                "inner_activation": "gelu",
                 "epsilon": self.epsilon,
                 "dropout_rate": 0.0
             }
@@ -1187,7 +1188,7 @@ class SelfAttention(layers.Layer):
 
         if self.ff_kwargs is None:
             ff_kwargs = {
-                "inner_activation": SquareRelu(),
+                "inner_activation": "gelu",
                 "epsilon": self.epsilon,
                 "dropout_rate": 0.0
             }

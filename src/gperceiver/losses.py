@@ -40,3 +40,51 @@ class ContrastiveLoss(tf.keras.losses.Loss):
         diffs = tf.reshape(diffs, (batch_size, batch_size))
         diffs = tf.reduce_mean(diffs, axis=-1)
         return diffs
+
+
+class PloidyBinaryCrossentropy(tf.keras.losses.BinaryCrossentropy):
+
+    def __init__(
+        self,
+        ploidy=2,
+        ploidy_scaler=1.0,
+        from_logits=False,
+        label_smoothing=0.,
+        axis=-1,
+        reduction=tf.keras.losses.Reduction.AUTO,
+        name="ploidy_binary_crossentropy",
+    ):
+
+        super().__init__(
+            from_logits=from_logits,
+            label_smoothing=label_smoothing,
+            axis=axis,
+            reduction=reduction,
+            name=name,
+        )
+        self.axis = axis
+        self.ploidy = ploidy
+        self.ploidy_scaler = ploidy_scaler
+        self.from_logits = from_logits
+        return
+
+    def call(self, ytrue, ypred):
+        loss = super().call(ytrue, ypred)
+
+        if self.from_logits:
+            ypred = tf.sigmoid(ypred)
+
+        loss += (
+            self.ploidy_scaler *
+            tf.math.squared_difference(
+                tf.convert_to_tensor(self.ploidy, dtype=ypred.dtype),
+                tf.reduce_sum(ypred, axis=self.axis)
+            )
+        )
+        return loss
+
+    def get_config(self):
+        config = super().get_config()
+        config["ploidy"] = self.ploidy
+        config["ploidy_scaler"] = self.ploidy_scaler
+        return config
