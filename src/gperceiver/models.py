@@ -22,8 +22,25 @@ from .layers import (
     CrossAttention,
     AlleleEmbedding,
     AlleleEmbedding2,
-    PositionEmbedding
+    PositionEmbedding,
+    FourierPositionEmbedding
 )
+
+
+class LayerWrapper(keras.Model):
+
+    def __init__(self, layer: layers.Layer, **kwargs):
+        super(LayerWrapper, self).__init__(**kwargs)
+        self.layer = layer
+        return
+
+    def call(self, X):
+        return self.layer(X)
+
+    def config(self):
+        config = super(LayerWrapper, self).get_config()
+        config["layer"] = self.layer.get_config()
+        return
 
 
 class LatentInitialiser(keras.Model):
@@ -141,6 +158,7 @@ class PerceiverEncoder(keras.Model):
         self_attention_dropout: float = 0.1,
         share_weights: "Union[bool, str]" = "after_first",
         ff_kwargs: "Optional[Mapping[str, Any]]" = None,
+        ff_units: "Optional[int]" = None,
         cross_attention_kwargs: "Optional[Mapping[str, Any]]" = None,
         projection_kwargs: "Optional[Mapping[str, Any]]" = None,
         self_attention_kwargs: "Optional[Mapping[str, Any]]" = None,
@@ -162,7 +180,8 @@ class PerceiverEncoder(keras.Model):
         self.cross_attention_dropout = cross_attention_dropout
         self.self_attention_dropout = self_attention_dropout
         self.share_weights = share_weights
-        assert share_weights in (True, False, "after_first", "after_first_xa")
+        assert share_weights in (True, False, "xa_only", "sa_only",
+                                 "after_first", "after_first_xa")
 
         if ff_kwargs is not None:
             ff_kwargs = dict(ff_kwargs)
@@ -189,6 +208,7 @@ class PerceiverEncoder(keras.Model):
             self_attention_kwargs = {}
 
         self.ff_kwargs = ff_kwargs
+        self.ff_units = ff_units
         self.cross_attention_kwargs = cross_attention_kwargs
         self.projection_kwargs = projection_kwargs
         self.self_attention_kwargs = self_attention_kwargs
@@ -202,6 +222,7 @@ class PerceiverEncoder(keras.Model):
             add_pos=self.add_pos,
             dropout_rate=self.cross_attention_dropout,
             ff_kwargs=self.ff_kwargs,
+            ff_units=self.ff_units,
             projection_kwargs=self.projection_kwargs,
             **self.cross_attention_kwargs
         )
@@ -213,11 +234,12 @@ class PerceiverEncoder(keras.Model):
             epsilon=self.epsilon,
             dropout_rate=self.self_attention_dropout,
             ff_kwargs=self.ff_kwargs,
+            ff_units=self.ff_units,
             name=f"self_attention_{i}_{j}",
             **self.self_attention_kwargs
         )
 
-    def build(self, input_shape):
+    def build(self, input_shape):  # noqa
 
         if self.share_weights in ("after_first", "after_first_xa", True):
             shared_sa_blocks = {
@@ -243,6 +265,32 @@ class PerceiverEncoder(keras.Model):
                 gen_first_sa = self.gen_sa
             else:
                 gen_first_sa = gen_sa
+
+        elif self.share_weights == "xa_only":
+            gen_sa = self.gen_sa
+            gen_first_sa = gen_sa
+
+            shared_xa_block = self.gen_xa("shared")
+
+            def gen_xa(i):
+                return shared_xa_block
+
+            gen_first_xa = gen_xa
+
+        elif self.share_weights == "sa_only":
+            gen_xa = self.gen_xa
+            gen_first_xa = gen_xa
+
+            shared_sa_blocks = {
+                j: self.gen_sa("shared", j)
+                for j in range(1, self.num_self_attention + 1)
+            }
+
+            def gen_sa(i, j):
+                return shared_sa_blocks[j]
+
+            gen_first_sa = gen_sa
+
         else:
             gen_sa = self.gen_sa
             gen_xa = self.gen_xa
@@ -324,14 +372,15 @@ class PerceiverEncoder(keras.Model):
         config = super(PerceiverEncoder, self).get_config()
         config["num_iterations"] = self.num_iterations
         config["projection_units"] = self.projection_units
-        config["num_self_attention_heads"] = self.num_self_attention_heads
         config["num_self_attention"] = self.num_self_attention
+        config["num_self_attention_heads"] = self.num_self_attention_heads
         config["epsilon"] = self.epsilon
         config["add_pos"] = self.add_pos
         config["cross_attention_dropout"] = self.cross_attention_dropout
         config["self_attention_dropout"] = self.self_attention_dropout
         config["share_weights"] = self.share_weights
         config["ff_kwargs"] = self.ff_kwargs
+        config["ff_units"] = self.ff_units
         config["cross_attention_kwargs"] = self.cross_attention_kwargs
         config["projection_kwargs"] = self.projection_kwargs
         config["self_attention_kwargs"] = self.self_attention_kwargs
@@ -343,8 +392,8 @@ class PerceiverEncoderDecoder(keras.Model):
     def __init__(
         self,
         latent_initialiser: LatentInitialiser,
-        position_embedder: "Union[PositionEmbedding, Embedding]",
-        allele_embedder: "Union[AlleleEmbedding, Embedding]",
+        position_embedder: "Union[PositionEmbedding, FourierPositionEmbedding, Embedding]",  # noqa
+        allele_embedder: "Union[AlleleEmbedding, AlleleEmbedding2, Embedding]",
         encoder: PerceiverEncoder,
         decoder: CrossAttention,
         predictor: layers.Layer,
@@ -367,7 +416,7 @@ class PerceiverEncoderDecoder(keras.Model):
         if allele_combiner == "add":
             self.allele_combiner_layer = layers.Add()
         else:
-            self.allele_combiner_layer = layers.concatenate(axis=-1)
+            self.allele_combiner_layer = layers.Concatenate(axis=-1)
         return
 
     def call(
@@ -385,8 +434,14 @@ class PerceiverEncoderDecoder(keras.Model):
         if isinstance(self.allele_embedder, layers.Embedding):
             alleles = self.allele_embedder(markers)
             alleles = tf.reduce_sum(alleles, axis=-2)
+        elif (
+            isinstance(self.allele_embedder, LayerWrapper)
+            and isinstance(self.allele_embedder.layer, layers.Embedding)
+        ):
+            alleles = self.allele_embedder(markers)
+            alleles = tf.reduce_sum(alleles, axis=-2)
         else:
-            alleles = self.allele_embedder((markers, x_pos))
+            alleles = self.allele_embedder([markers, x_pos])
 
         markers = self.allele_combiner_layer([alleles, x_position_embeddings])
 
@@ -434,12 +489,13 @@ class PerceiverEncoderDecoder(keras.Model):
     def get_config(self):
         config = super(PerceiverEncoderDecoder, self).get_config()
         config["latent_initialiser"] = self.latent_initialiser.get_config()
-        config["marker_embedder"] = self.marker_embedder.get_config()
+        config["position_embedder"] = self.position_embedder.get_config()
+        config["allele_embedder"] = self.allele_embedder.get_config()
         config["encoder"] = self.marker_encoder.get_config()
         config["decoder"] = self.latent_initializer.get_config()
         config["predictor"] = self.predictor.get_config()
-        config["num_decode_iters"] = self.num_decode_iters
         config["allele_combiner"] = self.allele_combiner
+        config["num_decode_iters"] = self.num_decode_iters
 
         if self.relational_embedder is None:
             config["relational_embedder"] = None
@@ -457,7 +513,7 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
         allele_embedder: "Union[AlleleEmbedding, AlleleEmbedding2, Embedding]",
         encoder: PerceiverEncoder,
         decoder: CrossAttention,
-        allele_predictor: layers.Layer,
+        allele_predictor: "Optional[layers.Layer]",
         contrast_predictor: layers.Layer,
         relational_embedder: "Optional[layers.Layer]" = None,
         num_decode_iters: int = 1,
@@ -497,6 +553,12 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
         training: "Optional[bool]" = False
     ):
         if isinstance(self.allele_embedder, layers.Embedding):
+            alleles = self.allele_embedder(X)
+            alleles = tf.reduce_sum(alleles, axis=-2)
+        elif (
+            isinstance(self.allele_embedder, LayerWrapper)
+            and isinstance(self.allele_embedder.layer, layers.Embedding)
+        ):
             alleles = self.allele_embedder(X)
             alleles = tf.reduce_sum(alleles, axis=-2)
         else:
@@ -569,7 +631,7 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
     ):
         x1, x2, x_pos, y_pos = X
 
-        latent = self.latent_initialiser(x_pos)
+        latent = self.latent_initialiser(x1)
         x_position_embeddings = self.position_embedder(x_pos)
         y_position_embeddings = self.position_embedder(y_pos)
 
@@ -602,6 +664,17 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
         combined = self.contrast(encoded1, encoded2)
         preds = self.contrast_predictor(combined)
 
+        if self.allele_predictor is None:
+            if return_attention_scores:
+                return (
+                    preds,
+                    xattention1, xattention2,
+                    sattention1, sattention2,
+                    oattention1, oattention2
+                )
+            else:
+                return preds
+
         preds1 = self.allele_predictor(encoded1)
         preds2 = self.allele_predictor(encoded2)
 
@@ -617,15 +690,23 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
 
     def get_config(self):
         config = super(TwinnedPerceiverEncoderDecoder, self).get_config()
+
+        if self.allele_predictor is None:
+            ap = None
+        else:
+            ap = self.allele_predictor.get_config()
+
         config["latent_initialiser"] = self.latent_initialiser.get_config()
-        config["marker_embedder"] = self.marker_embedder.get_config()
-        config["encoder"] = self.marker_encoder.get_config()
-        config["decoder"] = self.latent_initializer.get_config()
+        config["position_embedder"] = self.position_embedder.get_config()
+        config["allele_embedder"] = self.allele_embedder.get_config()
+        config["encoder"] = self.encoder.get_config()
+        config["decoder"] = self.decoder.get_config()
         config["contrast_predictor"] = self.contrast_predictor.get_config()
-        config["allele_predictor"] = self.allele_predictor.get_config()
+        config["allele_predictor"] = ap
+        config["contrast_predictor"] = self.contrast_predictor.get_config()
         config["num_decode_iters"] = self.num_decode_iters
-        config["contrast_method"] = self.contrast_method
         config["allele_combiner"] = self.allele_combiner
+        config["contrast_method"] = self.contrast_method
 
         if self.relational_embedder is None:
             config["relational_embedder"] = None
@@ -634,16 +715,170 @@ class TwinnedPerceiverEncoderDecoder(keras.Model):
         return config
 
 
-class PerceiverPredictor(object):
+class PerceiverPredictor(keras.Model):
 
-    def __init__(self):
+    def __init__(
+        self,
+        nblocks: int,
+        latent_output_dim: int,
+        latent_initialiser: LatentInitialiser,
+        position_embedder: "Union[PositionEmbedding, Embedding]",
+        allele_embedder: "Union[AlleleEmbedding, AlleleEmbedding2, Embedding]",
+        encoder: PerceiverEncoder,
+        predictor: "layers.Layer",
+        intercept: "layers.Layer",
+        relational_embedder: "Optional[layers.Layer]" = None,
+        allele_combiner: "Literal['add', 'concat']" = 'add',
+        block_strategy: "Literal['latent', 'pool']" = 'latent',
+        **kwargs
+    ):
+        super(PerceiverPredictor, self).__init__(**kwargs)
+        self.nblocks = nblocks
+        self.latent_initialiser = latent_initialiser
+        self.position_embedder = position_embedder
+        self.allele_embedder = allele_embedder
+        self.encoder = encoder
+        self.predictor = predictor
+        self.intercept = intercept
+        self.relational_embedder = relational_embedder
+        self.allele_combiner = allele_combiner
+
+        if allele_combiner == "add":
+            self.allele_combiner_layer = layers.Add()
+        else:
+            self.allele_combiner_layer = layers.Concatenate(axis=-1)
+
+        self.block_strategy = block_strategy
+
+        if latent_output_dim is not None:
+            self.latent_output_dim = latent_output_dim
+        elif latent_initialiser.__class__.__name__ == "LatentInitialiser":
+            self.latent_output_dim = latent_initialiser.output_dim
+        elif (
+            hasattr(latent_initialiser, "layer")
+            and (
+                latent_initialiser.layer.__class__.__name__
+                == "LatentInitialiser"
+            )
+        ):
+            self.latent_output_dim = latent_initialiser.layer.output_dim
+        else:
+            raise ValueError("Couldn't get value of latent_output_dim")
+
+        if block_strategy == 'latent':
+            self.block_layer = LatentInitialiser(
+                latent_output_dim,
+                nblocks,
+                name="block_embed",
+            )
+        else:
+            self.block_layer = layers.Embedding(
+                input_dim=nblocks,
+                output_dim=nblocks * 2,
+                name="block_embed"
+            )
         return
 
-    def call(self, X):
-        # New latents per env
-        # concat latents with new latents
-        # encode markers
-        # encoder([latent, markers])
-        # select env
-        # output_dense
-        return
+    def call(
+        self,
+        X,
+        mask=None,
+        return_attention_scores: bool = False,
+        return_embedding: bool = False,
+        training: "Optional[bool]" = False
+    ):
+        x, x_pos, block = X
+
+        latent = self.latent_initialiser(x, training=training)
+        if self.block_strategy == "latent":
+            latent = layers.concatenate([
+                self.block_layer(x_pos),
+                latent
+            ], axis=1)
+
+        position_embeddings = self.position_embedder(
+            x_pos,
+            training=training
+        )
+
+        if (
+            (self.allele_embedder.__class__.__name__ == "Embedding")
+            or (
+                hasattr(self.allele_embedder, "layer")
+                and (self.allele_embedder.layer.__class__.__name__ == "Embedding")  # noqa
+            )
+        ):
+            alleles = self.allele_embedder(x, training=training)
+            alleles = tf.reduce_sum(alleles, axis=-2)
+        else:
+            alleles = self.allele_embedder((x, x_pos), training=training)
+
+        markers = self.allele_combiner_layer([alleles, position_embeddings])
+
+        if self.relational_embedder is None:
+            encoded = self.encoder(
+                [latent, markers],
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+        else:
+            relational = self.relational_embedder(x_pos)
+            encoded = self.encoder(
+                [latent, markers, relational],
+                training=training,
+                return_attention_scores=return_attention_scores
+            )
+
+        if return_attention_scores:
+            encoded, xattention, sattention = encoded
+
+        if self.block_strategy == "latent":
+            embedding = layers.GlobalAveragePooling1D()(tf.squeeze(
+                tf.gather(encoded, block, axis=1),
+                axis=[2]
+            ))
+        else:
+            embedding = layers.concatenate([
+                layers.GlobalAveragePooling1D()(encoded),
+                layers.GlobalAveragePooling1D()(
+                    self.block_layer(block, training=training)
+                ),
+            ])
+
+        intercept = layers.GlobalAveragePooling1D()(
+            self.intercept(block)
+        )
+        preds = self.predictor(embedding, training=training)
+
+        preds = preds + intercept
+
+        if return_attention_scores:
+            if return_embedding:
+                return preds, xattention, sattention, embedding
+            else:
+                return preds, xattention, sattention
+
+        else:
+            if return_embedding:
+                return preds, embedding
+            else:
+                return preds
+
+    def get_config(self):
+        config = super(PerceiverPredictor, self).get_config()
+        config["nblocks"] = self.nblocks
+        config["latent_initialiser"] = self.latent_initialiser.get_config()
+        config["position_embedder"] = self.position_embedder.get_config()
+        config["allele_embedder"] = self.allele_embedder.get_config()
+        config["encoder"] = self.encoder.get_config()
+        config["predictor"] = self.predictor.get_config()
+        config["intercept"] = self.intercept.get_config()
+        config["allele_combiner"] = self.allele_combiner
+        config["block_strategy"] = self.block_strategy
+        config["latent_output_dim"] = self.latent_output_dim
+
+        if self.relational_embedder is None:
+            config["relational_embedder"] = None
+        else:
+            config["relational_embedder"] = self.relational_embedder.get_config()  # noqa
+        return config

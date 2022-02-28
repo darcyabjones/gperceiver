@@ -33,46 +33,134 @@ def pairwise_correlation(a, offset=1, metric="hamming"):
     return out.tolist()
 
 
-class PrepData(object):
+def gen_allele_decoder(ploidy: int = 2, nalleles: int = 3):
+    from itertools import combinations_with_replacement
+    return list(map(
+        list,
+        combinations_with_replacement(range(nalleles), ploidy)
+    ))
+
+
+@tf.function
+def allele_frequencies(alleles, nalleles):
+    # Allele 0 is always assumed to be missing data
+    counts = tf.reduce_sum(
+        tf.reduce_sum(tf.one_hot(alleles - 1, (nalleles - 1)), axis=-2),
+        axis=0
+    ) + 1
+    freqs = 1 - (counts / tf.reduce_sum(counts, axis=-1, keepdims=True))
+    freqs = tf.math.log(freqs)
+    freqs = tf.concat([
+        tf.fill((tf.shape(freqs)[0], 1), -1.0e+10),
+        freqs
+    ], axis=-1)
+    return freqs
+
+
+@tf.function
+def genotype_prob(alleles, freqs, nalleles):
+    return tf.reduce_sum(
+        tf.one_hot(alleles, nalleles) * tf.expand_dims(freqs, -2),
+        [-1, -2]
+    )
+
+
+class PrepPrediction(object):
+
     def __init__(
         self,
         allele_decoder: "List[List[int]]" = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]],  # noqa
         ploidy: int = 2,
-        prop_x: float = 0.5,
-        prop_y: float = 0.1,
         dtype=tf.float32,
-        seed: "Optional[int]" = None,
     ):
         from gperceiver.preprocessing import DecodeAlleles
         self.allele_decoder = DecodeAlleles(
             tf.constant(allele_decoder, dtype=tf.uint8)
         )
         self.ploidy = ploidy
+        self.dtype = dtype
+        return
+
+    def __call__(self, X):
+
+        def inner(x, y=None, sample_weights=None):
+            out = [(
+                self.allele_decoder(x[0]),
+                tf.expand_dims(
+                    tf.range(0, tf.shape(x[0])[1], dtype=tf.int64),
+                    0
+                ),
+                x[1]
+            )]
+
+            if y is not None:
+                out.append(y)
+
+            if sample_weights is not None:
+                assert y is not None
+                out.append(sample_weights)
+            return tuple(out)
+
+        return (
+            X
+            .batch(1)
+            .map(inner)
+            .unbatch()
+        )
+
+
+class PrepData(object):
+    def __init__(
+        self,
+        allele_frequencies: tf.Tensor,
+        allele_decoder: "List[List[int]]" = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]],  # noqa
+        nalleles: int = 3,
+        ploidy: int = 2,
+        prop_x: float = 0.5,
+        prop_y: float = 0.1,
+        frequency_scaler: float = 0.5,
+        dtype=tf.float32,
+        seed: "Optional[int]" = None,
+    ):
+        from gperceiver.preprocessing import DecodeAlleles
+        self.allele_frequencies = tf.constant(
+            allele_frequencies,
+            dtype=tf.float32
+        )
+        allele_decoder = tf.constant(allele_decoder, dtype=tf.uint8)
+
+        self.allele_decoder = DecodeAlleles(allele_decoder)
+
+        self.nalleles = nalleles
+        self.ploidy = ploidy
         self.prop_x = prop_x
         self.prop_y = prop_y
         self.dtype = dtype
         self.seed = seed
+        self.prep = PrepAEC(
+            ploidy=self.ploidy,
+            nalleles=self.nalleles,
+            allele_frequencies=self.allele_frequencies,
+            prop_x=self.prop_x,
+            prop_y=self.prop_y,
+            dtype=self.dtype,
+            frequency_scaler=frequency_scaler,
+            seed=self.seed
+        )
         return
 
     def __call__(self, x):
         return (
             x
-            .batch(1)
             .map(self.allele_decoder)
-            .unbatch()
-            .map(PrepAEC(
-                ploidy=self.ploidy,
-                prop_x=self.prop_x,
-                prop_y=self.prop_y,
-                dtype=self.dtype,
-                seed=self.seed
-            ))
+            .map(self.prep)
         )
 
 
 class PrepContrastData(object):
     def __init__(
         self,
+        allele_frequencies: tf.Tensor,
         allele_decoder: "List[List[int]]" = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [2, 2]],  # noqa
         ploidy: int = 2,
         prop_x: float = 0.5,
@@ -81,6 +169,10 @@ class PrepContrastData(object):
         seed: "Optional[int]" = None
     ):
         from gperceiver.preprocessing import DecodeAlleles
+        self.allele_frequencies = tf.constant(
+            allele_frequencies,
+            dtype=tf.float32
+        )
         self.allele_decoder = DecodeAlleles(
             tf.constant(allele_decoder, dtype=tf.uint8)
         )
@@ -89,25 +181,25 @@ class PrepContrastData(object):
         self.prop_y = prop_y
         self.dtype = dtype
         self.seed = seed
+        self.prep = PrepTwinnedAEC(
+            allele_frequencies,
+            ploidy=self.ploidy,
+            prop_x=self.prop_x,
+            prop_y=self.prop_y,
+            dtype=self.dtype,
+            seed=self.seed
+        )
         return
 
     def __call__(self, x):
         return (
             x
-            .batch(1)
             .map(self.allele_decoder)
-            .unbatch()
             .window(2, stride=1, shift=1)
             .flat_map(lambda z: z)
             .batch(2, drop_remainder=True)
             .map(lambda z: (z[0, ], z[1, ]))
-            .map(PrepTwinnedAEC(
-                ploidy=self.ploidy,
-                prop_x=self.prop_x,
-                prop_y=self.prop_y,
-                dtype=self.dtype,
-                seed=self.seed
-            ))
+            .map(self.prep)
         )
 
 
@@ -117,24 +209,43 @@ class DecodeAlleles(object):
         self.int_decoder = tf.convert_to_tensor(int_decoder, dtype=dtype)
         return
 
-    def __call__(self, X):
-        return tf.gather(self.int_decoder, X)
+    def __call__(self, X, y=None, w=None):
+        decoded = tf.gather(self.int_decoder, X)
+        if y is None:
+            assert w is None
+            return decoded
+        else:
+            if w is None:
+                return decoded, y
+            else:
+                return decoded, y, w
 
 
 class AlleleCounts(object):
 
-    def __init__(self):
+    def __init__(self, ploidy: int, nalleles: int):
+        self.ploidy = ploidy
+        self.nalleles = nalleles
         return
 
-    def __call__(self, X):
-        targets = tf.reduce_sum(tf.one_hot(X - 1, 2), axis=-2)
+    def __call__(self, X, w=None):
+        na = self.nalleles - 1
+        targets = tf.reduce_sum(tf.one_hot(X - 1, na), axis=-2)
         count_targets = tf.cast(
-            (tf.expand_dims(targets, -1) - tf.range(2, dtype=tf.float32)) > 0,
+            (tf.expand_dims(targets, -1) - tf.range(na, dtype=tf.float32)) > 0,
             tf.float32
         )
 
         shape = tf.shape(X)
-        return tf.reshape(count_targets, (shape[0], shape[1], 4))
+        reshaped = tf.reshape(
+            count_targets,
+            (shape[0], shape[1], na * self.ploidy)
+        )
+
+        if w is None:
+            return reshaped
+        else:
+            return reshaped, w
 
 
 class PrepAEC(object):
@@ -142,15 +253,24 @@ class PrepAEC(object):
     def __init__(
         self,
         ploidy: int,
+        nalleles: int,
+        allele_frequencies: tf.Tensor,
         prop_x: float = 1.0,
         prop_y: float = 0.1,
+        frequency_scaler: float = 0.5,
         dtype=tf.float32,
         seed=None,
     ):
         self.ploidy = ploidy
+        self.nalleles = nalleles
+        self.allele_frequencies = allele_frequencies
         self.prop_x = prop_x
         self.prop_y = prop_y
+
+        assert 0. < frequency_scaler <= 1.
+        self.frequency_scaler = frequency_scaler
         self.dtype = dtype
+
         if seed is None:
             import random
             self.seed = random.Random()
@@ -158,7 +278,7 @@ class PrepAEC(object):
             self.seed = random.Random(seed)
 
         from gperceiver.preprocessing import AlleleCounts
-        self.allele_counter = AlleleCounts()
+        self.allele_counter = AlleleCounts(ploidy, nalleles)
         return
 
     @staticmethod
@@ -200,6 +320,39 @@ class PrepAEC(object):
         X = tf.expand_dims(X, 0)
         return self.allele_counter(X)[0]
 
+    def sample_positions_single(
+        self,
+        n: int,
+        alleles,
+    ):
+        alleles = tf.expand_dims(alleles, 0)
+        any_missing = tf.reduce_any((alleles == 0), axis=-1)[0]
+
+        probs = (
+            self.frequency_scaler *
+            genotype_prob(alleles, self.allele_frequencies, self.nalleles)
+        )
+        # This sets is so that it should be impossible to sample loci with
+        # missing values.
+        probs = tf.where(any_missing, float("-inf"), probs)
+        # Sample twice as many so we can take unique samples
+        sample1 = tf.random.categorical(
+            logits=tf.cast(probs, tf.float32),
+            num_samples=tf.round(2 * n),
+            seed=self.seed.getrandbits(128),
+        )[0]
+
+        sample2 = tf.unique(sample1).y
+
+        if tf.size(sample2) == n:
+            indices = tf.sort(sample2)
+        elif tf.size(sample2) < n:
+            indices = tf.sort(sample1[:n])
+        else:
+            indices = tf.sort(sample2[:n])
+
+        return indices
+
     def __call__(self, X, w=None):
         """Prepares an auto-encoding type task"""
         y = self.count_alleles(X)
@@ -210,39 +363,13 @@ class PrepAEC(object):
                 self.prop_y * self.prop_x *
                 tf.cast(seq_len, tf.float32)
             )),
-            tf.int64
+            tf.int32
         )
 
-        is_null = tf.reduce_sum(y, axis=-1) == 0
-
-        candidates = tf.where(tf.logical_not(is_null))[:, 0]
-        candidates = tf.random.shuffle(
-            candidates,
-            seed=self.seed.getrandbits(128)
+        indices = self.sample_positions_single(
+            num_to_sample,
+            X
         )
-        ncandidates = tf.size(candidates, out_type=tf.int64)
-
-        if ncandidates < (num_to_sample * 2):
-            new_num_to_sample = tf.cast(
-                tf.math.round(ncandidates / 2),
-                tf.int64
-            )
-            remaining = num_to_sample - new_num_to_sample
-            num_to_sample = new_num_to_sample
-            del new_num_to_sample
-        else:
-            remaining = tf.cast(0, tf.int64)
-
-        indices = tf.gather(candidates, tf.range(num_to_sample))
-
-        if remaining > 0:
-            empty_candidates = tf.where(is_null)[:, 0]
-            empty_candidates = tf.random.shuffle(
-                empty_candidates,
-                seed=self.seed.getrandbits(128)
-            )
-            empty_candidates = tf.gather(empty_candidates, tf.range(remaining))
-            indices = tf.concat([indices, empty_candidates], 0)
 
         indices = tf.sort(indices, axis=0)
         mask = 1 - self.ones_from_indices(indices, seq_len, dtype=X.dtype)
@@ -277,16 +404,25 @@ class PrepTwinnedAEC(object):
 
     def __init__(
         self,
-        ploidy: int,
+        allele_frequencies: tf.Tensor,
+        ploidy: int = 2,
+        nalleles: int = 3,
         prop_x: float = 1.0,
         prop_y: float = 0.1,
+        frequency_scaler: float = 0.5,
         dtype=tf.float32,
         seed=None,
     ):
         self.ploidy = ploidy
+        self.nalleles = nalleles
+        self.allele_frequencies = allele_frequencies
         self.prop_x = prop_x
         self.prop_y = prop_y
+
+        assert 0. < frequency_scaler <= 1.
+        self.frequency_scaler = frequency_scaler
         self.dtype = dtype
+
         if seed is None:
             import random
             self.seed = random.Random()
@@ -294,7 +430,7 @@ class PrepTwinnedAEC(object):
             self.seed = random.Random(seed)
 
         from gperceiver.preprocessing import AlleleCounts
-        self.allele_counter = AlleleCounts()
+        self.allele_counter = AlleleCounts(ploidy, nalleles)
         return
 
     @staticmethod
@@ -336,6 +472,59 @@ class PrepTwinnedAEC(object):
         X = tf.expand_dims(X, 0)
         return self.allele_counter(X)[0]
 
+    def sample_positions_multi(
+        self,
+        n: int,
+        alleles1,
+        alleles2,
+    ):
+        alleles1 = tf.expand_dims(alleles1, 0)
+        any_missing1 = tf.reduce_any((alleles1 == 0), axis=-1)
+
+        probs1 = genotype_prob(
+            alleles1,
+            self.allele_frequencies,
+            self.nalleles
+        )
+
+        alleles2 = tf.expand_dims(alleles2, 0)
+        any_missing2 = tf.reduce_any((alleles2 == 0), axis=-1)
+
+        probs2 = genotype_prob(
+            alleles2,
+            self.allele_frequencies,
+            self.nalleles
+        )
+
+        # Probs is in log scale, so adding multiplys
+        probs = self.frequency_scaler * (probs1 + probs2)
+
+        any_missing = tf.expand_dims(tf.reduce_any(
+            tf.concat([any_missing1, any_missing2], axis=0),
+            axis=0
+        ), 0)
+
+        # This sets is so that it should be impossible to sample loci with
+        # missing values.
+        probs = tf.where(any_missing, float("-inf"), probs)
+        # Sample twice as many so we can take unique samples
+        sample1 = tf.random.categorical(
+            logits=tf.cast(probs, tf.float32),
+            num_samples=tf.round(2 * n),
+            seed=self.seed.getrandbits(128),
+        )[0]
+
+        sample2 = tf.unique(sample1).y
+
+        if tf.size(sample2) == n:
+            indices = tf.sort(sample2)
+        elif tf.size(sample2) < n:
+            indices = tf.sort(sample1[:n])
+        else:
+            indices = tf.sort(sample2[:n])
+
+        return indices
+
     def __call__(self, X1, X2, w=None):
         """Prepares an auto-encoding type task"""
         y1 = self.count_alleles(X1)
@@ -347,73 +536,14 @@ class PrepTwinnedAEC(object):
                 self.prop_y * self.prop_x *
                 tf.cast(seq_len, tf.float32) / 2
             )),
-            tf.int64
+            tf.int32
         )
 
-        any_different = tf.reduce_any(y1 != y2, axis=-1)
-        is_null = tf.logical_or(
-            tf.reduce_sum(y1, axis=-1) == 0,
-            tf.reduce_sum(y2, axis=-1) == 0
+        indices = self.sample_positions_multi(
+            num_to_sample,
+            X1,
+            X2
         )
-
-        diff_candidates = tf.where(tf.logical_and(
-            any_different,
-            tf.logical_not(is_null)
-        ))[:, 0]
-        same_candidates = tf.where(tf.logical_and(
-            tf.logical_not(any_different), tf.logical_not(is_null)
-        ))[:, 0]
-
-        diff_candidates = tf.random.shuffle(
-            diff_candidates,
-            seed=self.seed.getrandbits(128)
-        )
-        same_candidates = tf.random.shuffle(
-            same_candidates,
-            seed=self.seed.getrandbits(128)
-        )
-
-        if tf.size(diff_candidates, out_type=tf.int64) < (num_to_sample * 2):
-            num_diff = tf.cast(
-                tf.math.round(len(diff_candidates) / 2),
-                tf.int64
-            )
-        else:
-            num_diff = num_to_sample
-
-        diff_indices = tf.gather(diff_candidates, tf.range(num_diff))
-        remaining = num_to_sample - num_diff
-
-        if (
-            tf.size(same_candidates, out_type=tf.int64)
-            < ((num_to_sample + remaining) * 2)
-        ):
-            num_same = tf.cast(
-                tf.math.round(len(same_candidates) / 2),
-                tf.int64
-            )
-        else:
-            num_same = num_to_sample + remaining
-
-        same_indices = tf.gather(
-            same_candidates,
-            tf.range(num_same),
-            name="same"
-        )
-        indices = tf.concat([diff_indices, same_indices], 0)
-        remaining = (num_to_sample * 2) - (num_diff + num_same)
-
-        if remaining > 0:
-            extras = tf.random.uniform(
-                (remaining,),
-                minval=0,
-                maxval=seq_len,
-                dtype=same_indices.dtype
-            )
-
-            indices = tf.concat([indices, extras], 0)
-            del extras
-
         indices = tf.sort(indices, axis=0)
         mask = 1 - self.ones_from_indices(indices, seq_len, dtype=X1.dtype)
         mask = tf.expand_dims(mask, -1)

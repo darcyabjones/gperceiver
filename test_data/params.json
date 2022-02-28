@@ -1,0 +1,21 @@
+{
+  "nalleles": 3,
+  "ploidy": 2,
+  "allele_embed_kind": "1",
+  "allele_embed_dim": 256,
+  "allele_combiner": "add",
+  "position_embed_kind": "random",
+  "position_embed_dim": 256,
+  "position_embed_trainable": true,
+  "share_weights": true,
+  "projection_dim": 256,
+  "feedforward_dim": 512,
+  "latent_dim": 256,
+  "output_dim": 512,
+  "num_self_attention_heads": 4,
+  "num_self_attention": 2,
+  "num_encode_iters": 4,
+  "num_decode_iters": 2,
+  "contrastive": true,
+  "contrastive_weight": 0.0
+}

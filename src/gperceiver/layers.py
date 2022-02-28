@@ -637,6 +637,7 @@ class PositionEmbedding(layers.Layer):
         kwargs["autocast"] = False
         super(PositionEmbedding, self).__init__(**kwargs)
 
+        self.npositions = npositions
         self.output_dim = output_dim
 
         if chroms is None:
@@ -647,7 +648,7 @@ class PositionEmbedding(layers.Layer):
         if self.chroms is None:
             nchroms = None
         else:
-            nchroms = tf.size(tf.unique(self.chroms).y)
+            nchroms = tf.size(tf.unique(self.chroms).y).numpy()
 
         if chrom_output_dim is None:
             chrom_output_dim = output_dim
@@ -729,7 +730,7 @@ class PositionEmbedding(layers.Layer):
         config.update({
             "npositions": self.npositions,
             "output_dim": self.output_dim,
-            "chroms": self.chroms,
+            "chroms": self.chroms.numpy().tolist(),
             "chrom_output_dim": self.chrom_output_dim,
             "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
             "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
@@ -761,7 +762,7 @@ class FourierPositionEmbedding(layers.Layer):
         chrom_embeddings_regularizer=None,
         chrom_embeddings_constraint=None,
         chrom_mask_zero: bool = False,
-        chrom_embeddings_trainable=False,
+        chrom_embeddings_trainable=True,
         combine_method: str = "add",
         **kwargs,
     ):
@@ -872,9 +873,9 @@ class FourierPositionEmbedding(layers.Layer):
     def get_config(self):
         config = super(FourierPositionEmbedding, self).get_config()
         config.update({
-            "npositions": self.npositions,
+            "positions": self.positions.numpy().tolist(),
             "output_dim": self.output_dim,
-            "chroms": self.chroms,
+            "chroms": self.chroms.numpy().tolist(),
             "chrom_output_dim": self.chrom_output_dim,
             "position_embeddings_initializer": self.position_embeddings_initializer,  # noqa
             "position_embeddings_regularizer": self.position_embeddings_regularizer,  # noqa
@@ -900,6 +901,7 @@ class CrossAttention(layers.Layer):
         add_pos: bool = False,
         projection_kwargs: "Optional[Dict[str, Any]]" = None,
         ff_kwargs: "Optional[Dict[str, Any]]" = None,
+        ff_units: "Optional[int]" = None,
         **kwargs
     ):
         """A standard single headed attention layer with
@@ -916,6 +918,7 @@ class CrossAttention(layers.Layer):
         if ff_kwargs is None:
             ff_kwargs = {}
         self.ff_kwargs = ff_kwargs
+        self.ff_units = ff_units
 
         if projection_kwargs is None:
             projection_kwargs = {}
@@ -1043,8 +1046,13 @@ class CrossAttention(layers.Layer):
         else:
             ff_kwargs = self.ff_kwargs
 
+        if self.ff_units is None:
+            ff_units = q_shape[-1]
+        else:
+            ff_units = self.ff_units
+
         self.ff = ResidualDense(
-            inner_units=q_shape[-1],
+            inner_units=ff_units,
             name="ff",
             **ff_kwargs
         )
@@ -1129,6 +1137,7 @@ class CrossAttention(layers.Layer):
             "dropout_rate": self.dropout_rate,
             "projection_kwargs": self.projection_kwargs,
             "ff_kwargs": self.ff_kwargs,
+            "ff_units": self.ff_units,
         })
         return config
 
@@ -1159,6 +1168,7 @@ class SelfAttention(layers.Layer):
         epsilon: float = 1e-6,
         dropout_rate: float = 0.1,
         ff_kwargs: "Optional[Dict[str, Any]]" = None,
+        ff_units: "Optional[int]" = None,
         **kwargs
     ):
         super(SelfAttention, self).__init__(**kwargs)
@@ -1171,6 +1181,7 @@ class SelfAttention(layers.Layer):
         self.projection_units = projection_units
         self.epsilon = epsilon
         self.ff_kwargs = ff_kwargs
+        self.ff_units = ff_units
         self.supports_masking = True
         return
 
@@ -1195,8 +1206,13 @@ class SelfAttention(layers.Layer):
         else:
             ff_kwargs = self.ff_kwargs
 
+        if self.ff_units is None:
+            ff_units = input_shape[-1]
+        else:
+            ff_units = self.ff_units
+
         self.ff = ResidualDense(
-            inner_units=input_shape[-1],  # self.projection_units,
+            inner_units=ff_units,  # self.projection_units,
             name="ff",
             **ff_kwargs
         )
@@ -1243,6 +1259,7 @@ class SelfAttention(layers.Layer):
             "projection_units": self.projection_units,
             "epsilon": self.epsilon,
             "dropout_rate": self.dropout_rate,
-            "ff_kwargs": self.ff_kwargs
+            "ff_kwargs": self.ff_kwargs,
+            "ff_units": self.ff_units
         })
         return config

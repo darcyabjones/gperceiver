@@ -3,6 +3,8 @@
 import sys
 import traceback
 import argparse
+import json
+from os.path import join as pjoin
 
 from typing import List
 
@@ -12,7 +14,6 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.data import Dataset
 from tensorflow import keras
-from tensorflow.keras import layers
 
 from tensorflow_addons.optimizers import LAMB
 
@@ -21,21 +22,15 @@ from .exitcodes import (
     EXIT_INPUT_NOT_FOUND, EXIT_SYSERR, EXIT_CANT_OUTPUT
 )
 
-from ..preprocessing import PrepContrastData, PrepData
-from ..layers import (
-    CrossAttention,
-)
-from ..losses import PloidyBinaryCrossentropy
-
-from ..models import (
-    LatentInitialiser,
-    PositionEmbedding,
-    PerceiverEncoder,
-    PerceiverEncoderDecoder,
-    TwinnedPerceiverEncoderDecoder,
+from ..preprocessing import PrepContrastData, PrepData, allele_frequencies
+from ..losses import (
+    PloidyBinaryCrossentropy,
+    PloidyBinaryFocalCrossentropy,
 )
 
 from ..callbacks import ReduceLRWithWarmup
+
+from .utils import Params, build_encoder_decoder_model
 
 __email__ = "darcy.ab.jones@gmail.com"
 
@@ -95,37 +90,9 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--nalleles",
-        type=int,
-        help="How many different alleles are in there?",
-        default=3,
-    )
-
-    parser.add_argument(
-        "--ploidy",
-        type=int,
-        help="What's the ploidy",
-        default=2,
-    )
-
-    parser.add_argument(
-        "--encoder",
+        "--model",
         type=str,
-        help="Where to store the encoder model",
-        default=None
-    )
-
-    parser.add_argument(
-        "--latent",
-        type=str,
-        help="Where to store the latent model",
-        default=None
-    )
-
-    parser.add_argument(
-        "--encoder-decoder",
-        type=str,
-        help="Where to store the combined encoder/decoder model",
+        help="Where to save the models",
         default=None
     )
 
@@ -151,92 +118,31 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--marker-embed-dim",
+        "--logs",
+        type=str,
+        help="Save a log file in tsv format",
+        default=None
+    )
+
+    parser.add_argument(
+        "--params",
+        type=argparse.FileType('r'),
+        help="The model hyperparameters",
+        default=None
+    )
+
+    parser.add_argument(
+        "--nalleles",
         type=int,
-        help="The number of dimensions for the per-marker learned embeddings",
-        default=256
+        help="How many different alleles are in there?",
+        default=None,
     )
 
     parser.add_argument(
-        "--position-embed-dim",
+        "--ploidy",
         type=int,
-        help="The number of dimensions for the position embeddings",
-        default=256
-    )
-
-    parser.add_argument(
-        "--position-embed-trainable",
-        action="store_true",
-        help=(
-            "How many epochs to wait before setting the "
-            "positional encodings to be trainable. "
-            "0 lets train from beginning, -1 (default)"
-            "means it wont ever be trainable."
-        ),
-        default=False
-    )
-
-    parser.add_argument(
-        "--allele-combiner",
-        choices=["add", "concat"],
-        default="add",
-        help="How to combine allele info with positional info"
-    )
-
-    parser.add_argument(
-        "--share-weights",
-        choices=["after_first_xa", "true", "false", "after_first"],
-        default="after_first_xa",
-        help="Should we share weights between layers"
-    )
-
-    parser.add_argument(
-        "--projection-dim",
-        type=int,
-        help="The number of channels to use for attention comparisons",
-        default=128
-    )
-
-    parser.add_argument(
-        "--latent-dim",
-        type=int,
-        help="The number of learned latent features to use",
-        default=128
-    )
-
-    parser.add_argument(
-        "--output-dim",
-        type=int,
-        help="The number of channels to use in latent features",
-        default=256
-    )
-
-    parser.add_argument(
-        "--num-sa-heads",
-        type=int,
-        help="The number heads to use for self attention",
-        default=4
-    )
-
-    parser.add_argument(
-        "--num-sa",
-        type=int,
-        help="The number of transformers to use for self attention",
-        default=2
-    )
-
-    parser.add_argument(
-        "--num-encode-iters",
-        type=int,
-        help="The number iterations to run through the encoder network",
-        default=4
-    )
-
-    parser.add_argument(
-        "--num-decode-iters",
-        type=int,
-        help="The number of iterations to run through the decoder network",
-        default=2
+        help="What's the ploidy",
+        default=None,
     )
 
     parser.add_argument(
@@ -254,20 +160,10 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--warmup-epochs",
+        "--warmup-steps",
         type=int,
-        help="The number of epochs to ramp up the learning rate",
-        default=4,
-    )
-
-    parser.add_argument(
-        "--pre-warmup-epochs",
-        type=int,
-        help=(
-            "The number of epochs run with a minimal learning rate "
-            "before beginning the warmup."
-        ),
-        default=1,
+        help="The number of steps (minibatches) to ramp up the learning rate",
+        default=100,
     )
 
     parser.add_argument(
@@ -323,59 +219,23 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--logs",
-        type=str,
-        help="Save a log file in tsv format",
-        default=None
-    )
-
-    parser.add_argument(
-        "--encoder-nontrainable",
-        action="store_true",
-        help="set the encoder to be non-trainable",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--decoder-nontrainable",
-        action="store_true",
-        help="set the decoder to be non-trainable",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--latent-nontrainable",
-        action="store_true",
-        help="set the latent to be non-trainable",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--marker-nontrainable",
-        action="store_true",
-        help="set the marker to be non-trainable",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--predictor-nontrainable",
-        action="store_true",
-        help="set the predictor to be non-trainable",
-        default=False,
-    )
-
-    parser.add_argument(
         "--contrastive",
         action="store_true",
         help="Learn by contrasting samples",
-        default=False,
+        default=None,
     )
 
     parser.add_argument(
-        "--contrastive-weight",
+        "--contrastive-allele-weight",
+        dest="contrastive_weight",
         type=float,
-        default=1.0,
-        help="Weight contrastive loss by this amount. Should be <= 1."
+        default=0.0,
+        help=(
+            "Weight allele weight for contrastive loss by this amount. "
+            "Should be <= 1. "
+            "0 disables allele weight completely, so only contrastive weight. "
+            "1 means that allele and contrast loss contribute equally."
+        )
     )
 
     parser.add_argument(
@@ -392,6 +252,16 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         help="a seed"
     )
 
+    parser.add_argument(
+        "--loss",
+        choices=[
+            "binary",
+            "binary_focal"
+        ],
+        default="binary_focal",
+        help="What loss function should we optimise for?"
+    )
+
     parsed = parser.parse_args(args)
 
     return parsed
@@ -400,9 +270,6 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
 def runner(args):  # noqa
     assert 0 < args.prop_x <= 1
     assert 0 < args.prop_y < 1
-
-    if args.allele_combiner == "add":
-        assert args.marker_embed_dim == args.position_embed_dim
 
     if tf.config.list_physical_devices("GPU"):
         strategy = tf.distribute.MultiWorkerMirroredStrategy()
@@ -415,6 +282,7 @@ def runner(args):  # noqa
     chrom_map = np.sort(chroms["chr"].unique())
     chrom_map = dict(zip(chrom_map, range(len(chrom_map))))
     chrom_pos = chroms["chr"].apply(chrom_map.get).astype("int32").values
+    marker_pos = chroms["pos"].astype("float32").values
 
     genos = pd.read_csv(args.markers, sep="\t")
     assert genos.columns[0] == "name"
@@ -425,177 +293,110 @@ def runner(args):  # noqa
     nsamples = genos.shape[0]
 
     train = Dataset.from_tensor_slices(genos.values.astype("int32"))
+
+    if args.params is not None:
+        dparams = json.load(args.params)
+    else:
+        dparams = {}
+
+    params = Params.from_dict(
+        dparams,
+        nmarkers=nmarkers,
+        chrom_pos=chrom_pos,
+        marker_pos=marker_pos,
+        nalleles=args.nalleles,
+        ploidy=args.ploidy,
+        contrastive=args.contrastive
+    )
+
+    freqs = allele_frequencies(
+        tf.gather(params.allele_decoder, genos.values.astype("int32")),
+        3
+    )
     del genos
 
-    if args.contrastive:
+    if params.contrastive:
         prep_aec = PrepContrastData(
-            ploidy=args.ploidy,
+            allele_frequencies=freqs,
+            allele_decoder=params.allele_decoder,
+            ploidy=params.ploidy,
             prop_x=args.prop_x,
             prop_y=args.prop_y,
             seed=args.seed,
         )
     else:
         prep_aec = PrepData(
-            ploidy=args.ploidy,
+            allele_frequencies=freqs,
+            allele_decoder=params.allele_decoder,
+            ploidy=params.ploidy,
             prop_x=args.prop_x,
             prop_y=args.prop_y,
             seed=args.seed,
         )
 
-    # This stuff initialises it so that the encoder can take
-    # variable length sequences
-    if args.allele_combiner == "add":
-        data_dims = args.marker_embed_dim
-    else:
-        data_dims = args.marker_embed_dim + args.marker_embed_dim
-    lsize = [
-        layers.Input((None, args.output_dim)),
-        layers.Input((None, data_dims)),
-    ]
-
-    if args.share_weights == "true":
-        args.share_weights = True
-
-    elif args.share_weights == "false":
-        args.share_weights = False
-
     with strategy.scope():
-        latent_initialiser = LatentInitialiser(
-            args.output_dim,
-            args.latent_dim,
-            name="latent"
-        )
+        (
+            latent_initialiser,
+            position_embedding,
+            allele_embedding,
+            encoder,
+            model,
+        ) = build_encoder_decoder_model(params)
 
-        position_embedding = PositionEmbedding(
-            npositions=nmarkers,
-            chroms=chrom_pos,
-            output_dim=args.position_embed_dim,
-            position_embeddings_trainable=args.position_embed_trainable,
-            name="position_embedding",
-        )
-
-        allele_embedding = layers.Embedding(
-            input_dim=args.nalleles,
-            output_dim=args.marker_embed_dim,
-            name="allele_embedding"
-        )
-
-        encoder = PerceiverEncoder(
-            num_iterations=args.num_encode_iters,
-            projection_units=args.projection_dim,
-            num_self_attention=args.num_sa,
-            num_self_attention_heads=args.num_sa_heads,
-            add_pos=True,
-            share_weights=args.share_weights,
-            name="encoder"
-        )
-
-        # lsize was set out of scope
-        encoder(lsize)
-
-        decoder = CrossAttention(
-            projection_units=args.projection_dim,
-            name="decoder"
-        )
-
-        allele_predictor = layers.Dense(
-            (args.nalleles - 1) * args.ploidy,
-            activation="linear",
-            name="allele_predictor"
-        )
-
-        if args.contrastive:
-            contrast_predictor = keras.Sequential([
-                layers.Dense(
-                    (args.nalleles - 1) * args.ploidy,
-                    activation="gelu",
-                ),
-                layers.Dense(
-                    (args.nalleles - 1),
-                    activation="linear",
-                    name="contrast_predictor"
-                )
-            ])
-            model = TwinnedPerceiverEncoderDecoder(
-                latent_initialiser=latent_initialiser,
-                position_embedder=position_embedding,
-                allele_embedder=allele_embedding,
-                encoder=encoder,
-                decoder=decoder,
-                allele_predictor=allele_predictor,
-                contrast_predictor=contrast_predictor,
-                relational_embedder=None,
-                num_decode_iters=args.num_decode_iters,
-                name="encoder_decoder",
-                allele_combiner=args.allele_combiner,
-                contrast_method="concat"
-            )
-        else:
-            model = PerceiverEncoderDecoder(
-                latent_initialiser=latent_initialiser,
-                position_embedder=position_embedding,
-                allele_embedder=allele_embedding,
-                encoder=encoder,
-                decoder=decoder,
-                predictor=allele_predictor,
-                relational_embedder=None,
-                num_decode_iters=args.num_decode_iters,
-                name="encoder_decoder"
-            )
-
-        if (args.warmup_epochs == 0) and (args.pre_warmup_epochs == 0):
+        if args.warmup_steps == 0:
             initial_lr = args.lr
         else:
             initial_lr = args.warmup_lr
 
-        allele_pred_loss = PloidyBinaryCrossentropy(
-            from_logits=True,
-            ploidy=args.ploidy,
-            ploidy_scaler=args.ploidy_scaler
-        )
-        if args.contrastive:
+        if args.loss == "binary":
+            allele_pred_loss = PloidyBinaryCrossentropy(
+                from_logits=True,
+                ploidy=params.ploidy,
+                ploidy_scaler=args.ploidy_scaler
+            )
+            contrast_loss = tf.keras.losses.BinaryCrossentropy(
+                from_logits=True, label_smoothing=0.0, axis=-1,
+                name='binary_crossentropy'
+            )
+        elif args.loss == "binary_focal":
+            allele_pred_loss = PloidyBinaryFocalCrossentropy(
+                from_logits=True,
+                ploidy=params.ploidy,
+                ploidy_scaler=args.ploidy_scaler
+            )
+
+            contrast_loss = tf.keras.losses.BinaryFocalCrossentropy(
+                from_logits=True, label_smoothing=0.0, axis=-1,
+                name='binary_crossentropy'
+            )
+        else:
+            raise ValueError(f"Invalid loss {args.loss}")
+
+        if params.contrastive and model.allele_predictor is not None:
             loss_fns = [
-                tf.keras.losses.BinaryCrossentropy(
-                    from_logits=True, label_smoothing=0.0, axis=-1,
-                    name='binary_crossentropy'
-                ),
+                contrast_loss,
                 allele_pred_loss,
                 allele_pred_loss
             ]
         else:
             loss_fns = allele_pred_loss
+
         model.compile(
             optimizer=LAMB(initial_lr, weight_decay_rate=0.0001),
             loss=loss_fns,
-            metrics=tf.keras.metrics.BinaryAccuracy(
-                name='binary_accuracy', threshold=0.0
-            ),
+            metrics=[
+                keras.metrics.BinaryAccuracy(threshold=0.0),
+            ],
         )
 
     if args.checkpoint is not None:
         model.load_weights(args.checkpoint)
 
-    if args.encoder_nontrainable:
-        model.encoder.trainable = False
-
-    if args.decoder_nontrainable:
-        model.decoder.trainable = False
-
-    if args.latent_nontrainable:
-        model.latent_initialiser.trainable = False
-
-    if args.marker_nontrainable:
-        model.marker_embedder.trainable = False
-
-    if args.predictor_nontrainable:
-        model.predictor.trainable = False
-
-    position_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
+    # position_embedding.position_embedder.trainable = args.position_embed_trainable  # noqa
 
     reduce_lr = ReduceLRWithWarmup(
         max_lr=args.lr,
-        pre_warmup=args.pre_warmup_epochs,
-        warmup=args.warmup_epochs,
+        warmup=args.warmup_steps,
         monitor='loss',
         factor=0.1,
         patience=args.reduce_lr_patience,
@@ -608,7 +409,7 @@ def runner(args):  # noqa
     early_stopping = keras.callbacks.EarlyStopping(
         monitor="loss",
         patience=args.early_stopping_patience,
-        restore_best_weights=True
+        restore_best_weights=False
     )
 
     callbacks = [early_stopping, reduce_lr]
@@ -642,29 +443,36 @@ def runner(args):  # noqa
 
     batch_size = args.batch_size * strategy.num_replicas_in_sync
 
-    dataset = train.shuffle(nsamples).apply(prep_aec)
-    if args.contrastive:
-        contrast_weight = 0.5 * args.contrastive_weight
+    dataset = (
+        train
+        .shuffle(nsamples + 1, reshuffle_each_iteration=True)
+        .apply(prep_aec)
+    )
+    if params.contrastive:
+        contrast_weight = 0.5 * params.contrastive_weight
         dataset = dataset.map(
             lambda x, y: (x, y, (1, contrast_weight, contrast_weight))
         )
 
-    # Fit the model.
-    model.fit(
-        dataset.batch(batch_size),
-        epochs=args.nepochs + args.warmup_epochs + args.pre_warmup_epochs,
-        callbacks=callbacks,
-        verbose=1
-    )
+    try:
+        # Fit the model.
+        model.fit(
+            dataset.batch(batch_size),
+            epochs=args.nepochs,
+            callbacks=callbacks,
+            verbose=1
+        )
+    finally:
+        model.summary(expand_nested=True, show_trainable=True)
 
-    if args.encoder_decoder is not None:
-        model.save(args.encoder_decoder)
-
-    if args.encoder is not None:
-        model.encoder.save(args.encoder)
-
-    if args.latent is not None:
-        model.latent_initialiser.save(args.latent)
+        if args.model is not None:
+            model.save(pjoin(args.model, "encoder_decoder"))
+            model.encoder.save(pjoin(args.model, "encoder"))
+            model.latent_initialiser.save(pjoin(args.model, "latent"))
+            model.position_embedder.save(pjoin(args.model, "position"))
+            model.allele_embedder.save(pjoin(args.model, "allele"))
+            with open(pjoin(args.model, "params.json"), "w") as handle:
+                json.dump(params.to_dict(), handle, indent=2)
 
 
 def main():  # noqa
