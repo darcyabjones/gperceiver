@@ -66,23 +66,23 @@ class Params(object):
         self.nmarkers: int = int(nmarkers)
         self.chrom_pos: "List[int]" = list(map(int, chrom_pos))
         self.marker_pos: "List[float]" = list(map(float, marker_pos))
-        self.nalleles: int = int(or_else(nalleles, 3))
-        self.ploidy: int = int(or_else(ploidy, 2))
+        self.nalleles: int = int(or_else(3, nalleles))
+        self.ploidy: int = int(or_else(2, ploidy))
 
         self.allele_embed_kind: "Literal['1', '2', '3']" = or_else(
+            '1',
             allele_embed_kind,
-            '1'
         )
         self.__assert_options(
             "allele_embed_kind",
             ['1', '2', '3']
         )
 
-        self.allele_embed_dim: int = int(or_else(allele_embed_dim, 256))
+        self.allele_embed_dim: int = int(or_else(256, allele_embed_dim))
 
         self.allele_combiner: "Literal['add', 'concat']" = or_else(
+            'add',
             allele_combiner,
-            'add'
         )
         self.__assert_options(
             "allele_combiner",
@@ -90,23 +90,23 @@ class Params(object):
         )
 
         self.position_embed_kind: "Literal['random', 'fourier']" = or_else(
+            'random',
             position_embed_kind,
-            'random'
         )
         self.__assert_options(
             "position_embed_kind",
             ['random', 'fourier']
         )
 
-        self.position_embed_dim: int = int(or_else(position_embed_dim, 256))
+        self.position_embed_dim: int = int(or_else(256, position_embed_dim))
         self.position_embed_trainable: bool = bool(or_else(
+            True,
             position_embed_trainable,
-            True
         ))
 
         self.share_weights: "Union[bool, Literal['xa_only', 'sa_only', 'after_first_xa', 'after_first']]" = or_else(  # noqa
+            True,
             share_weights,
-            True
         )
         self.__assert_options(
             "share_weights",
@@ -114,26 +114,27 @@ class Params(object):
              'after_first_xa', 'after_first']
         )
 
-        self.projection_dim: int = int(or_else(projection_dim, 256))
-        self.feedforward_dim: int = int(or_else(feedforward_dim, 512))
-        self.latent_dim: int = int(or_else(latent_dim, 256))
-        self.output_dim: int = int(or_else(output_dim, 512))
-        self.num_self_attention_heads: int = int(or_else(num_self_attention_heads, 4))  # noqa
-        self.num_self_attention: int = int(or_else(num_self_attention, 2))
-        self.num_encode_iters: int = int(or_else(num_encode_iters, 4))
-        self.num_decode_iters: int = int(or_else(num_decode_iters, 2))
-        self.contrastive: bool = bool(or_else(contrastive, True))
-        self.contrastive_weight: float = float(or_else(contrastive_weight, 0.0))  # noqa
+        self.projection_dim: int = int(or_else(256, projection_dim))
+        self.feedforward_dim: int = int(or_else(512, feedforward_dim))
+        self.latent_dim: int = int(or_else(256, latent_dim))
+        self.output_dim: int = int(or_else(512, output_dim))
+        self.num_self_attention_heads: int = int(or_else(4, num_self_attention_heads))  # noqa
+        self.num_self_attention: int = int(or_else(2, num_self_attention))
+        self.num_encode_iters: int = int(or_else(4, num_encode_iters))
+        self.num_decode_iters: int = int(or_else(2, num_decode_iters))
+        self.contrastive: bool = bool(or_else(True, contrastive))
+
+        self.contrastive_weight: float = float(or_else(0.0, contrastive_weight))  # noqa
         self.nblocks: "Optional[int]" = nblocks
         self.block_strategy: "Literal['pool', 'latent']" = or_else(
+            "pool",
             block_strategy,
-            "pool"
         )
         self.__assert_options("block_strategy", ["pool", "latent"])
 
         self.allele_decoder: "List[List[int]]" = or_else(
+            gen_allele_decoder(self.ploidy, self.nalleles),
             allele_decoder,
-            gen_allele_decoder(ploidy, nalleles)
         )
 
         self.__check_options()
@@ -182,7 +183,6 @@ class Params(object):
         nblocks: "Optional[int]" = None,
         block_strategy: "Optional[Literal['pool', 'latent']]" = None,
         allele_decoder: "Optional[List[List[int]]]" = None,
-        **kwargs
     ):
         if nmarkers is None:
             assert "nmarkers" in params
@@ -204,33 +204,34 @@ class Params(object):
             ))
         else:
             marker_pos_ = marker_pos
+        cw = or_else(params.get("contrastive_weight", None), contrastive_weight)  # noqa
 
         return cls(
             nmarkers_,
             chrom_pos_,
             marker_pos_,
-            or_else(nalleles, params.get("nalleles", None)),
-            or_else(ploidy, params.get("ploidy", None)),
-            or_else(allele_embed_kind, params.get("allele_embed_kind", None)),
-            or_else(allele_embed_dim, params.get("allele_embed_dim", None)),
-            or_else(allele_combiner, params.get("allele_combiner", None)),
-            or_else(position_embed_kind, params.get("position_embed_kind", None)),  # noqa
-            or_else(position_embed_dim, params.get("position_embed_dim", None)),  # noqa
-            or_else(position_embed_trainable, params.get("position_embed_trainable", None)),  # noqa
-            or_else(share_weights, params.get("share_weights", None)),
-            or_else(projection_dim, params.get("projection_dim", None)),
-            or_else(feedforward_dim, params.get("feedforward_dim", None)),
-            or_else(latent_dim, params.get("latent_dim", None)),
-            or_else(output_dim, params.get("output_dim", None)),
-            or_else(num_self_attention_heads, params.get("num_self_attention_heads", None)),  # noqa
-            or_else(num_self_attention, params.get("num_self_attention", None)),  # noqa
-            or_else(num_encode_iters, params.get("num_encode_iters", None)),
-            or_else(num_decode_iters, params.get("num_decode_iters", None)),
-            or_else(contrastive, params.get("contrastive", None)),
-            or_else(contrastive_weight, params.get("contrastive_weight", None)),  # noqa
-            or_else(nblocks, params.get("nblocks", None)),  # noqa
-            or_else(block_strategy, params.get("block_strategy", None)),  # noqa
-            or_else(allele_decoder, params.get("allele_decoder", None)),  # noqa
+            or_else(params.get("nalleles", None), nalleles),
+            or_else(params.get("ploidy", None), ploidy),
+            or_else(params.get("allele_embed_kind", None), allele_embed_kind),
+            or_else(params.get("allele_embed_dim", None), allele_embed_dim),
+            or_else(params.get("allele_combiner", None), allele_combiner),
+            or_else(params.get("position_embed_kind", None), position_embed_kind),  # noqa
+            or_else(params.get("position_embed_dim", None), position_embed_dim),  # noqa
+            or_else(params.get("position_embed_trainable", None), position_embed_trainable),  # noqa
+            or_else(params.get("share_weights", None), share_weights),
+            or_else(params.get("projection_dim", None), projection_dim),
+            or_else(params.get("feedforward_dim", None), feedforward_dim),
+            or_else(params.get("latent_dim", None), latent_dim),
+            or_else(params.get("output_dim", None), output_dim),
+            or_else(params.get("num_self_attention_heads", None), num_self_attention_heads),  # noqa
+            or_else(params.get("num_self_attention", None), num_self_attention),  # noqa
+            or_else(params.get("num_encode_iters", None), num_encode_iters),
+            or_else(params.get("num_decode_iters", None), num_decode_iters),
+            or_else(params.get("contrastive", None), contrastive),
+            cw,
+            or_else(params.get("nblocks", None), nblocks),  # noqa
+            or_else(params.get("block_strategy", None), block_strategy),  # noqa
+            or_else(params.get("allele_decoder", None), allele_decoder),  # noqa
         )
 
     def to_dict(self) -> "Dict[str, Any]":
@@ -399,9 +400,9 @@ def build_encoder_decoder_model(
             encoder=encoder,
             decoder=decoder,
             allele_predictor=(
-                None
-                if params.contrastive_weight == 0
-                else allele_predictor
+                allele_predictor
+                if params.contrastive_weight > 0
+                else None
             ),
             contrast_predictor=contrast_predictor,
             relational_embedder=None,

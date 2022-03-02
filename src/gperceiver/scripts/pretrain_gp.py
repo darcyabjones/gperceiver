@@ -306,12 +306,13 @@ def runner(args):  # noqa
         marker_pos=marker_pos,
         nalleles=args.nalleles,
         ploidy=args.ploidy,
-        contrastive=args.contrastive
+        contrastive=args.contrastive,
+        contrastive_weight=args.contrastive_weight
     )
 
     freqs = allele_frequencies(
         tf.gather(params.allele_decoder, genos.values.astype("int32")),
-        3
+        params.nalleles
     )
     del genos
 
@@ -352,7 +353,8 @@ def runner(args):  # noqa
             allele_pred_loss = PloidyBinaryCrossentropy(
                 from_logits=True,
                 ploidy=params.ploidy,
-                ploidy_scaler=args.ploidy_scaler
+                ploidy_scaler=args.ploidy_scaler,
+                name="allele_crossentropy"
             )
             contrast_loss = tf.keras.losses.BinaryCrossentropy(
                 from_logits=True, label_smoothing=0.0, axis=-1,
@@ -362,7 +364,8 @@ def runner(args):  # noqa
             allele_pred_loss = PloidyBinaryFocalCrossentropy(
                 from_logits=True,
                 ploidy=params.ploidy,
-                ploidy_scaler=args.ploidy_scaler
+                ploidy_scaler=args.ploidy_scaler,
+                name="allele_crossentropy"
             )
 
             contrast_loss = tf.keras.losses.BinaryFocalCrossentropy(
@@ -372,7 +375,7 @@ def runner(args):  # noqa
         else:
             raise ValueError(f"Invalid loss {args.loss}")
 
-        if params.contrastive and model.allele_predictor is not None:
+        if params.contrastive and (params.contrastive_weight > 0):
             loss_fns = [
                 contrast_loss,
                 allele_pred_loss,
@@ -381,12 +384,15 @@ def runner(args):  # noqa
         else:
             loss_fns = allele_pred_loss
 
+        metrics = keras.metrics.BinaryAccuracy(
+            threshold=0.0,
+            name="accuracy"
+        )
+
         model.compile(
             optimizer=LAMB(initial_lr, weight_decay_rate=0.0001),
             loss=loss_fns,
-            metrics=[
-                keras.metrics.BinaryAccuracy(threshold=0.0),
-            ],
+            metrics=metrics,
         )
 
     if args.checkpoint is not None:
