@@ -467,7 +467,6 @@ def runner(args):  # noqa
     prep = PrepPrediction(
         allele_decoder=params.allele_decoder,
         ploidy=params.ploidy,
-        nalleles=params.nalleles
     )
 
     with strategy.scope():

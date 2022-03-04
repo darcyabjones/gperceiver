@@ -222,7 +222,7 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
         "--contrastive",
         action="store_true",
         help="Learn by contrasting samples",
-        default=None,
+        default=False,
     )
 
     parser.add_argument(
@@ -310,10 +310,11 @@ def runner(args):  # noqa
         contrastive_weight=args.contrastive_weight
     )
 
-    freqs = allele_frequencies(
-        tf.gather(params.allele_decoder, genos.values.astype("int32")),
-        params.nalleles
-    )
+    with tf.device("cpu:0"):
+        freqs = allele_frequencies(
+            tf.gather(params.allele_decoder, genos.values.astype("int32")),
+            params.nalleles
+        )
     del genos
 
     if params.contrastive:
@@ -466,7 +467,7 @@ def runner(args):  # noqa
             dataset.batch(batch_size),
             epochs=args.nepochs,
             callbacks=callbacks,
-            verbose=1
+            verbose=0
         )
     finally:
         model.summary(expand_nested=True, show_trainable=True)
