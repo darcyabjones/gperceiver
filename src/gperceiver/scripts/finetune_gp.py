@@ -36,7 +36,8 @@ from ..models import (
     LayerWrapper,
     LatentInitialiser,
     PerceiverEncoder,
-    PerceiverPredictor
+    PerceiverPredictor,
+    IndexSelector
 )
 
 from ..callbacks import ReduceLRWithWarmup
@@ -352,7 +353,7 @@ def prep_dataframes(
         nsamples = g.shape[0]
         nblocks = np.max(b) + 1
         ds = Dataset.from_tensor_slices((
-            (g, b), p
+            g, b, p
         ))
         return ds, nmarkers, nsamples, nblocks
 
@@ -399,16 +400,15 @@ def prep_pred_dataframes(
     blocks.set_index("name", inplace=True)
 
     combined = pd.merge(phenos, blocks, on=["name", "block"], how="outer")
-    combined = pd.merge(combined, genos, left_on="name", right_index=True)
+    #combined = pd.merge(combined, genos, left_on="name", right_index=True)
     combined.set_index("name", inplace=True)
 
-    g = combined[genos.columns].values.astype("int32")
-    b = combined[["block"]].values.astype("int32")
     ds = Dataset.from_tensor_slices(
-        ((g, b),)
+        (genos.values.astype("int32"),)
     )
+    gorder = genos.index.values
 
-    return ds, combined.loc[:, ~combined.columns.isin(genos.columns)]
+    return ds, gorder, combined
 
 
 def runner(args):  # noqa
@@ -456,13 +456,13 @@ def runner(args):  # noqa
     )
 
     if args.predictions is not None:
-        predict_ds, predict_df = prep_pred_dataframes(
+        predict_ds, predict_ds_index, predict_df = prep_pred_dataframes(
             chroms,
             genos,
             phenos,
         )
     else:
-        predict_ds, predict_df = None, None
+        predict_ds, predict_ds_index, predict_df = None, None, None
 
     prep = PrepPrediction(
         allele_decoder=params.allele_decoder,
@@ -530,7 +530,7 @@ def runner(args):  # noqa
         else:
             initial_lr = args.warmup_lr
 
-        model = PerceiverPredictor(
+        inner_model = PerceiverPredictor(
             nblocks=params.nblocks,
             latent_output_dim=params.output_dim,
             latent_initialiser=latent_initialiser,
@@ -553,7 +553,11 @@ def runner(args):  # noqa
             ),
             allele_combiner="add",
             block_strategy=params.block_strategy,
+            name="gperceiver"
         )
+
+        model = IndexSelector(inner_model, name="selector")
+
         if args.checkpoint is not None:
             model.load_weights(args.checkpoint)
 
@@ -671,9 +675,9 @@ def runner(args):  # noqa
             model.summary(expand_nested=True, show_trainable=True)
 
             print("Setting embedder to trainable")
-            model.encoder.trainable = args.encoder_trainable
-            model.latent_initialiser.trainable = args.latent_trainable
-            model.position_embedder.trainable = args.position_embed_trainable
+            inner_model.encoder.trainable = args.encoder_trainable
+            inner_model.latent_initialiser.trainable = args.latent_trainable
+            inner_model.position_embedder.trainable = args.position_embed_trainable
 
             model.compile(
                 optimizer=LAMB(initial_lr, weight_decay_rate=0.0001),
@@ -696,16 +700,25 @@ def runner(args):  # noqa
         model.summary(expand_nested=True, show_trainable=True)
 
         if args.predictions is not None:
-            preds = model.predict(
+            preds = inner_model.predict(
                 predict_ds
                 .apply(prep)
                 .batch(batch_size)
             )
-            predict_df["preds"] = preds[:, 0]
-            predict_df.to_csv(args.predictions, index=True, sep="\t")
+            preds = pd.DataFrame(preds, index=predict_ds_index)
+            preds.index.name = "name"
+            preds = pd.melt(preds, ignore_index=False, var_name="block", value_name="prediction")
+            print(preds)
+            preds = pd.merge(
+                predict_df.reset_index(),
+                preds.reset_index(),
+                on=["name", "block"],
+                how="outer"
+            )
+            preds.to_csv(args.predictions, index=False, sep="\t")
 
-        if args.predictor is not None:
-            model.save(args.predictor)
+        if args.model is not None:
+            inner_model.save(args.model)
 
 
 def main():  # noqa

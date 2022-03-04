@@ -83,15 +83,24 @@ class PrepPrediction(object):
 
     def __call__(self, X):
 
-        def inner(x, y=None, sample_weights=None):
-            out = [(
-                self.allele_decoder(x[0]),
-                tf.expand_dims(
-                    tf.range(0, tf.shape(x[0])[1], dtype=tf.int64),
-                    0
-                ),
-                x[1]
-            )]
+        def inner(x, b=None, y=None, sample_weights=None):
+            if b is None:
+                out = [(
+                    self.allele_decoder(x),
+                    tf.expand_dims(
+                        tf.range(0, tf.shape(x)[1], dtype=tf.int64),
+                        0
+                    ),
+                )]
+            else:
+                out = [(
+                    self.allele_decoder(x),
+                    tf.expand_dims(
+                        tf.range(0, tf.shape(x)[1], dtype=tf.int64),
+                        0
+                    ),
+                    b
+                )]
 
             if y is not None:
                 out.append(y)

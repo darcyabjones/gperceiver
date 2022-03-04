@@ -787,7 +787,14 @@ class PerceiverPredictor(keras.Model):
         return_embedding: bool = False,
         training: "Optional[bool]" = False
     ):
-        x, x_pos, block = X
+        x, x_pos = X
+
+        batch_len = tf.shape(x)[0]
+        block = tf.repeat(
+            tf.expand_dims(tf.range(self.nblocks), 0),
+            batch_len,
+            axis=0
+        )
 
         latent = self.latent_initialiser(x, training=training)
         if self.block_strategy == "latent":
@@ -833,24 +840,22 @@ class PerceiverPredictor(keras.Model):
             encoded, xattention, sattention = encoded
 
         if self.block_strategy == "latent":
-            embedding = layers.GlobalAveragePooling1D()(tf.squeeze(
-                tf.gather(encoded, block, axis=1),
-                axis=[2]
-            ))
+            embedding = tf.gather(encoded, block, axis=1, batch_dims=1)
         else:
+            enc = layers.GlobalAveragePooling1D()(encoded)
+            enc = tf.expand_dims(enc, axis=1)
+            enc = tf.repeat(enc, self.nblocks, axis=1)
+            bl = self.block_layer(block, training=training)
             embedding = layers.concatenate([
-                layers.GlobalAveragePooling1D()(encoded),
-                layers.GlobalAveragePooling1D()(
-                    self.block_layer(block, training=training)
-                ),
+                enc,
+                bl
             ])
 
-        intercept = layers.GlobalAveragePooling1D()(
-            self.intercept(block)
-        )
+        intercept = self.intercept(block)
         preds = self.predictor(embedding, training=training)
 
         preds = preds + intercept
+        preds = tf.reduce_sum(preds, axis=-1)
 
         if return_attention_scores:
             if return_embedding:
@@ -882,3 +887,62 @@ class PerceiverPredictor(keras.Model):
         else:
             config["relational_embedder"] = self.relational_embedder.get_config()  # noqa
         return config
+
+
+class IndexSelector(keras.Model):
+
+    def __init__(
+        self,
+        model: keras.Model,
+        **kwargs
+    ):
+        super(IndexSelector, self).__init__(**kwargs)
+        self.model = model
+        return
+
+    def call(
+        self,
+        X,
+        mask=None,
+        return_attention_scores: bool = False,
+        return_embedding: bool = False,
+        training: "Optional[bool]" = False
+    ):
+        x, x_pos, block = X
+        preds = self.model(
+            [x, x_pos],
+            mask=mask,
+            return_attention_scores=return_attention_scores,
+            return_embedding=return_embedding,
+            training=training
+        )
+
+        if return_attention_scores:
+            if return_embedding:
+                preds, xattention, sattention, embedding = preds
+            else:
+                preds, xattention, sattention = preds
+
+        else:
+            if return_embedding:
+                preds, embedding = preds
+            else:
+                preds = preds
+
+        print("gether", preds)
+        preds = layers.GlobalAveragePooling1D()(
+            tf.gather(preds, block, axis=1)
+        )
+        print("gether", preds)
+
+        if return_attention_scores:
+            if return_embedding:
+                return preds, xattention, sattention, embedding
+            else:
+                return preds, xattention, sattention
+
+        else:
+            if return_embedding:
+                return preds, embedding
+            else:
+                return preds
