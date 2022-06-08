@@ -1,0 +1,16 @@
+name: gperceiver
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - jupyterlab
+  - scipy
+  - numpy
+  - tensorflow
+  - scikit-learn
+  - pip:
+    - tensorflow_addons
+    - .

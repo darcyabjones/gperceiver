@@ -1,6 +1,49 @@
 import tensorflow as tf
 
 
+class RankLoss(tf.keras.losses.Loss):
+
+    def __init__(
+        self,
+        reduction=tf.keras.losses.Reduction.AUTO,
+        name=None,
+        **kwargs
+    ):
+        super().__init__(reduction=reduction, name=name)
+        return
+
+    def call(self, y_true, y_pred):
+
+        y_true = tf.cast(
+            tf.convert_to_tensor(y_true, name="y_true"),
+            dtype=tf.dtypes.float32
+        )
+
+        if len(y_true.shape) == 1:
+            y_true = tf.reshape(y_true, (1, -1))
+
+        y_pred = tf.cast(
+            tf.convert_to_tensor(y_pred, name="y_pred"),
+            dtype=tf.dtypes.float32
+        )
+        if len(y_pred.shape) == 1:
+            y_pred = tf.reshape(y_pred, (1, -1))
+
+        adjacency = tf.math.greater(
+            tf.subtract(y_true, tf.transpose(y_true)),
+            0.
+        )
+        adjacency = tf.cast(adjacency, tf.dtypes.float32)
+
+        pred_diffs = tf.subtract(y_pred, tf.transpose(y_pred))
+        pred_diffs = tf.math.multiply(tf.nn.sigmoid(pred_diffs), adjacency)
+        pred_diffs = tf.reshape(pred_diffs, (-1, 1))
+        adjacency = tf.reshape(adjacency, (-1, 1))
+
+        loss = tf.losses.binary_crossentropy(adjacency, pred_diffs)
+        return loss
+
+
 class ContrastiveLoss(tf.keras.losses.Loss):
 
     def __init__(

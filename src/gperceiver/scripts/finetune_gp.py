@@ -264,7 +264,8 @@ def cli(prog: str, args: List[str]) -> argparse.Namespace:
             "mae",
             "binary",
             "poisson",
-            "binary_focal"
+            "binary_focal",
+	    "pairwise",
         ],
         default="mse",
         help="What loss function should we optimise for?"
@@ -571,6 +572,9 @@ def runner(args):  # noqa
             loss = keras.losses.BinaryCrossentropy(from_logits=True)
         elif args.loss == "binary_focal":
             loss = keras.losses.BinaryFocalCrossentropy(from_logits=True)
+	elif args.loss == "pairwise":
+            from ..losses import RankLoss
+            loss = RankLoss()
 
         if args.loss in ("mse", "mae", "poisson"):
             metrics = [
